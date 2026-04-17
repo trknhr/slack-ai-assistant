@@ -9,6 +9,7 @@ This repository provides the application glue around Managed Agents:
 - scheduled runs through EventBridge Scheduler
 - session mapping and event deduplication
 - attachment handling for PDFs, images, and text files
+- raw Slack attachment archival to private S3 storage
 - custom tool execution backed by DynamoDB for memories and tasks
 
 The goal is to keep reasoning and sandboxing inside Claude Managed Agents while handling webhooks, state, and integrations in AWS.
@@ -30,21 +31,37 @@ Scheduled reminder
   -> Claude Managed Agent
   -> Slack post
 
+Local bulk import
+  -> CLI script
+  -> API Gateway
+  -> Lambda (document-import-api)
+  -> S3 presigned upload
+  -> SQS
+  -> Lambda (document-import-worker)
+  -> Claude Managed Agent
+
 State
   -> DynamoDB
+
+Raw attachment archive
+  -> private S3
 ```
 
 ## What is included
 
 - `slack-events-ingress` Lambda
 - `slack-events-worker` Lambda
+- `document-import-api` Lambda
+- `document-import-worker` Lambda
 - `scheduled-agent-runner` Lambda
 - API Gateway
 - SQS + DLQ
-- 7 DynamoDB tables
+- 8 DynamoDB tables
+- private S3 bucket for supported Slack attachments
 - EventBridge Scheduler
 - Claude Managed Agents session + event loop integration
 - custom tool execution loop for memory and task persistence
+- local bulk import for `pdf`, `jpg/jpeg`, and `png`
 
 ## DynamoDB tables
 
@@ -62,6 +79,8 @@ State
   Stores current task state
 - `TaskEventsTable`
   Stores task history
+- `SourceDocumentsTable`
+  Stores archived Slack attachment metadata and archive status
 
 ## Repository layout
 
@@ -77,6 +96,7 @@ src/
   memory/
   repo/
   shared/
+  documents/
   slack/
   tasks/
   tools/
@@ -125,6 +145,132 @@ Optional overrides:
 - `ANTHROPIC_MANAGED_AGENTS_BETA`
 - `ANTHROPIC_CUSTOM_TOOLS_FILE`
 
+## Local bulk import
+
+Bulk import uses the existing private S3 archive bucket plus `SourceDocumentsTable`.
+
+Supported formats:
+
+- `.pdf`
+- `.jpg`
+- `.jpeg`
+- `.png`
+
+Recommended local input directory:
+
+- `private-docs/`
+
+It is ignored by git by default.
+
+Example:
+
+```bash
+npm run import-local-docs -- \
+  --api-base-url https://YOUR_API_ID.execute-api.ap-northeast-1.amazonaws.com/prod \
+  --workspace-id T0123456789 \
+  --user-id U0123456789 \
+  --region ap-northeast-1 \
+  --wait \
+  private-docs
+```
+
+Flow:
+
+1. The script requests a presigned upload URL from `/imports/uploads`.
+2. It uploads the original file to private S3.
+3. It queues processing through `/imports/documents`.
+4. The import worker sends the file to Claude and persists tasks and memories through the existing custom tools.
+5. The script can poll `/imports/workspaces/{workspaceId}/sources/{sourceId}` until completion.
+
+Security:
+
+- `imports/*` endpoints use `AWS_IAM` authorization.
+- The local script signs requests with SigV4 using your current AWS credentials.
+- Your IAM principal must have `execute-api:Invoke` permission for the import routes.
+
+## Markdown ingestion
+
+Markdown ingestion uses the same `SourceDocumentsTable`, private S3 archive bucket, and import worker.
+
+Supported formats:
+
+- `.md`
+- `.markdown`
+
+Recommended local input directory:
+
+- `private-notes/`
+
+It is ignored by git by default.
+
+Example:
+
+```bash
+npm run ingest-markdown -- \
+  --api-base-url https://YOUR_API_ID.execute-api.ap-northeast-1.amazonaws.com/prod \
+  --workspace-id T0123456789 \
+  --user-id U0123456789 \
+  --region ap-northeast-1 \
+  --wait \
+  private-notes
+```
+
+Flow:
+
+1. The script reads local markdown files and posts them to `/imports/markdown`.
+2. The API stores the original markdown in private S3 under `raw/private/notes/...`.
+3. It queues processing through the existing document import worker.
+4. The worker sends the note to Claude and persists tasks and memories through the existing custom tools.
+5. The script can poll `/imports/workspaces/{workspaceId}/sources/{sourceId}` until completion.
+
+Security:
+
+- `/imports/markdown` also uses `AWS_IAM` authorization.
+- The local script signs requests with SigV4 using your current AWS credentials.
+- Your IAM principal must have `execute-api:Invoke` permission for the import routes.
+
+## Direct chat from your terminal
+
+For quick questions outside Slack, you can call the Managed Agent through an IAM-protected API route:
+
+- `POST /chat/messages`
+
+The repository also includes a signed local CLI:
+
+```bash
+npm run ask-agent -- \
+  --api-base-url https://YOUR_API_ID.execute-api.ap-northeast-1.amazonaws.com/prod \
+  --workspace-id T0123456789 \
+  --user-id local-importer-teru \
+  --region ap-northeast-1 \
+  "今日のやることは？"
+```
+
+The response includes:
+
+- `session_id`
+- Claude's text response
+- any saved memory IDs
+- any task IDs touched during the answer
+
+To continue the same conversation, pass the returned `session_id` back:
+
+```bash
+npm run ask-agent -- \
+  --api-base-url https://YOUR_API_ID.execute-api.ap-northeast-1.amazonaws.com/prod \
+  --workspace-id T0123456789 \
+  --user-id local-importer-teru \
+  --region ap-northeast-1 \
+  --session-id sess_... \
+  "今夜中のものだけ教えて"
+```
+
+Notes:
+
+- `/chat/messages` uses `AWS_IAM` authorization.
+- The route is synchronous and best suited to short questions.
+- For long-running workflows, keep using Slack, scheduled jobs, or import workers.
+
 ## Current scope
 
 - `ENABLE_USER_MEMORY=false` by default
@@ -162,7 +308,8 @@ Requirements and limits:
 
 - your Slack app must include `files:read`
 - the current default max file size is `10MB` per file
-- unsupported or oversized files are degraded into text notes instead of breaking the conversation
+- supported Slack attachments are archived to a private S3 bucket before being sent to Claude
+- unsupported or oversized files are recorded as skipped metadata and degraded into text notes instead of breaking the conversation
 
 ## Managed Agent notes
 

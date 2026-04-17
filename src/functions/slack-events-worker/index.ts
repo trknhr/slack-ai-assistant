@@ -8,12 +8,14 @@ import { loadWorkerEnv } from "../../config/env";
 import { MemoryStoreService } from "../../memory/getOrCreateMemoryStore";
 import { MemoryItemRepository } from "../../repo/memoryItemRepository";
 import { SessionRepository } from "../../repo/sessionRepository";
+import { SourceDocumentRepository } from "../../repo/sourceDocumentRepository";
 import { TaskEventRepository } from "../../repo/taskEventRepository";
 import { TaskStateRepository } from "../../repo/taskStateRepository";
 import { UserMemoryRepository } from "../../repo/userMemoryRepository";
 import { slackQueueMessageSchema, ThreadSessionRecord } from "../../shared/contracts";
 import { logger } from "../../shared/logger";
 import { SlackFilesClient } from "../../slack/filesClient";
+import { SlackAttachmentArchiveService } from "../../slack/slackAttachmentArchiveService";
 import { SlackWebClient } from "../../slack/postMessage";
 import { CustomToolExecutor } from "../../tools/executeCustomTool";
 
@@ -32,10 +34,15 @@ const slackFilesClient = new SlackFilesClient(
 );
 const memoryItemRepository = new MemoryItemRepository(env.MEMORY_ITEMS_TABLE_NAME);
 const sessionRepository = new SessionRepository(env.SESSION_TABLE_NAME);
+const sourceDocumentRepository = new SourceDocumentRepository(env.SOURCE_DOCUMENTS_TABLE_NAME);
 const taskEventRepository = new TaskEventRepository(env.TASK_EVENTS_TABLE_NAME);
 const taskStateRepository = new TaskStateRepository(env.TASKS_TABLE_NAME);
 const userMemoryRepository = new UserMemoryRepository(env.USER_MEMORY_TABLE_NAME);
 const memoryStoreService = new MemoryStoreService(userMemoryRepository, claudeClient);
+const attachmentArchiveService = new SlackAttachmentArchiveService(
+  env.SLACK_ATTACHMENT_ARCHIVE_BUCKET_NAME,
+  sourceDocumentRepository,
+);
 
 export async function handler(event: SQSEvent): Promise<void> {
   for (const record of event.Records) {
@@ -104,7 +111,17 @@ export async function handler(event: SQSEvent): Promise<void> {
       ),
     );
 
-    const attachmentBlocks = await slackFilesClient.buildContentBlocks(queueMessage.files);
+    const preparedAttachments = await slackFilesClient.prepareAttachments(queueMessage.files);
+    await attachmentArchiveService.archiveAttachments({
+      workspaceId: queueMessage.workspaceId,
+      channelId: queueMessage.channelId,
+      threadTs: queueMessage.threadTs,
+      messageTs: queueMessage.messageTs,
+      userId: queueMessage.userId,
+      attachments: preparedAttachments,
+      logger: log,
+    });
+    const attachmentBlocks = slackFilesClient.buildContentBlocks(preparedAttachments);
     const customToolExecutor = new CustomToolExecutor(
       {
         memoryItems: memoryItemRepository,
@@ -152,6 +169,7 @@ export async function handler(event: SQSEvent): Promise<void> {
       sessionId: sessionRecord.sessionId,
       status: completion.status,
       attachmentCount: queueMessage.files.length,
+      archivedAttachmentCount: preparedAttachments.filter((attachment) => attachment.status === "ready").length,
     });
   }
 }

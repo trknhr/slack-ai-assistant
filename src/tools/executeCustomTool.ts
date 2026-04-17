@@ -61,7 +61,15 @@ export interface ToolExecutionResult {
   isError?: boolean;
 }
 
+export interface ToolExecutionSummary {
+  savedMemoryIds: string[];
+  taskIds: string[];
+}
+
 export class CustomToolExecutor {
+  private readonly savedMemoryIds = new Set<string>();
+  private readonly taskIds = new Set<string>();
+
   constructor(
     private readonly repositories: ToolRepositories,
     private readonly context: ToolExecutionContext,
@@ -100,6 +108,13 @@ export class CustomToolExecutor {
     }
   }
 
+  getSummary(): ToolExecutionSummary {
+    return {
+      savedMemoryIds: [...this.savedMemoryIds],
+      taskIds: [...this.taskIds],
+    };
+  }
+
   private async searchMemories(input: Record<string, unknown>): Promise<ToolExecutionResult> {
     const parsed = searchMemoriesSchema.parse(input);
     const memories = await this.repositories.memoryItems.search({
@@ -135,6 +150,7 @@ export class CustomToolExecutor {
       sourceType: "agent",
       createdByUserId: this.context.userId,
     });
+    this.savedMemoryIds.add(memory.memoryId);
 
     return jsonResult({
       saved: true,
@@ -192,6 +208,7 @@ export class CustomToolExecutor {
       completedAt: parsed.status === "done" ? existing?.completedAt ?? new Date().toISOString() : undefined,
       completedByUserId: parsed.status === "done" ? this.context.userId : undefined,
     });
+    this.taskIds.add(task.taskId);
 
     await this.repositories.taskEvents.save({
       taskId: task.taskId,
@@ -222,6 +239,7 @@ export class CustomToolExecutor {
       completedByUserId: this.context.userId,
       completedAt: parsed.completed_at,
     });
+    this.taskIds.add(task.taskId);
 
     await this.repositories.taskEvents.save({
       taskId: task.taskId,

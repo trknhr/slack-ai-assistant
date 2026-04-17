@@ -46,12 +46,31 @@ const ingressEnvSchema = baseEnvSchema.extend({
   SLACK_QUEUE_URL: requiredString,
 });
 
-const workerEnvSchema = baseEnvSchema;
+const workerEnvSchema = baseEnvSchema.extend({
+  SOURCE_DOCUMENTS_TABLE_NAME: requiredString,
+  SLACK_ATTACHMENT_ARCHIVE_BUCKET_NAME: requiredString,
+});
+
+const importApiEnvSchema = baseEnvSchema.extend({
+  SOURCE_DOCUMENTS_TABLE_NAME: requiredString,
+  DOCUMENT_IMPORT_QUEUE_URL: requiredString,
+  DOCUMENT_ARCHIVE_BUCKET_NAME: requiredString,
+});
+
+const importWorkerEnvSchema = baseEnvSchema.extend({
+  SOURCE_DOCUMENTS_TABLE_NAME: requiredString,
+  DOCUMENT_ARCHIVE_BUCKET_NAME: requiredString,
+});
+
+const chatApiEnvSchema = baseEnvSchema;
 
 const schedulerEnvSchema = baseEnvSchema;
 
 export type IngressEnv = z.infer<typeof ingressEnvSchema>;
 export type WorkerEnv = z.infer<typeof workerEnvSchema>;
+export type ImportApiEnv = z.infer<typeof importApiEnvSchema>;
+export type ImportWorkerEnv = z.infer<typeof importWorkerEnvSchema>;
+export type ChatApiEnv = z.infer<typeof chatApiEnvSchema>;
 export type SchedulerEnv = z.infer<typeof schedulerEnvSchema>;
 
 export function loadIngressEnv(): IngressEnv {
@@ -60,6 +79,18 @@ export function loadIngressEnv(): IngressEnv {
 
 export function loadWorkerEnv(): WorkerEnv {
   return workerEnvSchema.parse(process.env);
+}
+
+export function loadImportApiEnv(): ImportApiEnv {
+  return importApiEnvSchema.parse(process.env);
+}
+
+export function loadImportWorkerEnv(): ImportWorkerEnv {
+  return importWorkerEnvSchema.parse(process.env);
+}
+
+export function loadChatApiEnv(): ChatApiEnv {
+  return chatApiEnvSchema.parse(process.env);
 }
 
 export function loadSchedulerEnv(): SchedulerEnv {

@@ -1,5 +1,10 @@
-import { SlackFileReference } from "../shared/contracts";
 import { ClaudeInputBlock } from "../claude/client";
+import { buildClaudeContentBlocksForDocument } from "../documents/contentBlocks";
+import { SlackFileReference } from "../shared/contracts";
+import {
+  inferMimeTypeFromName,
+  isSupportedSlackArchiveMimeType,
+} from "./fileSupport";
 
 interface SlackApiFileInfoResponse {
   ok: boolean;
@@ -19,36 +24,162 @@ interface SlackApiFileInfoResponse {
   };
 }
 
+export type PreparedSlackAttachmentStatus =
+  | "ready"
+  | "external_link"
+  | "skipped_missing_url"
+  | "skipped_oversize"
+  | "skipped_unsupported"
+  | "download_failed";
+
+export interface PreparedSlackAttachment {
+  file: SlackFileReference;
+  label: string;
+  mimeType?: string;
+  status: PreparedSlackAttachmentStatus;
+  contentBlocks: ClaudeInputBlock[];
+  contentBytes?: Buffer;
+}
+
 export class SlackFilesClient {
   constructor(
     private readonly tokenProvider: () => Promise<string>,
     private readonly maxFileBytes: number,
   ) {}
 
-  async buildContentBlocks(files: SlackFileReference[]): Promise<ClaudeInputBlock[]> {
-    const blocks: ClaudeInputBlock[] = [];
+  async prepareAttachments(files: SlackFileReference[]): Promise<PreparedSlackAttachment[]> {
+    const attachments: PreparedSlackAttachment[] = [];
 
-    for (const file of files.slice(0, 3)) {
+    for (const file of files) {
       try {
-        const resolved = await this.resolveFile(file);
-        blocks.push(...(await this.toContentBlocks(resolved)));
+        attachments.push(await this.prepareAttachment(file));
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown attachment error";
-        blocks.push({
-          type: "text",
-          text: `Attachment note: Could not read ${file.name ?? file.title ?? file.id}. ${message}`,
+        attachments.push({
+          file,
+          label: file.name ?? file.title ?? file.id,
+          mimeType: file.mimetype ?? inferMimeTypeFromName(file.name),
+          status: "download_failed",
+          contentBlocks: [
+            {
+              type: "text",
+              text: `Attachment note: Could not read ${file.name ?? file.title ?? file.id}. ${message}`,
+            },
+          ],
         });
       }
     }
 
-    if (files.length > 3) {
+    return attachments;
+  }
+
+  buildContentBlocks(attachments: PreparedSlackAttachment[], maxInlineFiles = 3): ClaudeInputBlock[] {
+    const blocks: ClaudeInputBlock[] = [];
+
+    for (const attachment of attachments.slice(0, maxInlineFiles)) {
+      blocks.push(...attachment.contentBlocks);
+    }
+
+    if (attachments.length > maxInlineFiles) {
       blocks.push({
         type: "text",
-        text: `Attachment note: ${files.length - 3} additional file(s) were omitted to keep the request bounded.`,
+        text: `Attachment note: ${attachments.length - maxInlineFiles} additional file(s) were archived but omitted from inline analysis to keep the request bounded.`,
       });
     }
 
     return blocks;
+  }
+
+  private async prepareAttachment(file: SlackFileReference): Promise<PreparedSlackAttachment> {
+    const resolved = await this.resolveFile(file);
+    const label = resolved.name ?? resolved.title ?? resolved.id;
+    const mimeType = resolved.mimetype ?? inferMimeTypeFromName(resolved.name);
+
+    if (resolved.isExternal && resolved.externalUrl) {
+      return {
+        file: resolved,
+        label,
+        mimeType,
+        status: "external_link",
+        contentBlocks: [
+          {
+            type: "text",
+            text: `Attached external file: ${label}. URL: ${resolved.externalUrl}`,
+          },
+        ],
+      };
+    }
+
+    if (resolved.size && resolved.size > this.maxFileBytes) {
+      return {
+        file: resolved,
+        label,
+        mimeType,
+        status: "skipped_oversize",
+        contentBlocks: [
+          {
+            type: "text",
+            text: `Attachment note: ${label} was skipped because it is larger than ${this.maxFileBytes} bytes.`,
+          },
+        ],
+      };
+    }
+
+    const downloadUrl = resolved.urlPrivateDownload ?? resolved.urlPrivate;
+    if (!downloadUrl) {
+      return {
+        file: resolved,
+        label,
+        mimeType,
+        status: "skipped_missing_url",
+        contentBlocks: [
+          {
+            type: "text",
+            text: `Attachment note: ${label} did not include a downloadable URL.`,
+          },
+        ],
+      };
+    }
+
+    if (!isSupportedSlackArchiveMimeType(mimeType)) {
+      return {
+        file: resolved,
+        label,
+        mimeType,
+        status: "skipped_unsupported",
+        contentBlocks: [
+          {
+            type: "text",
+            text: `Attachment note: ${label} (${mimeType ?? "unknown mime type"}) is not yet supported for inline analysis.`,
+          },
+        ],
+      };
+    }
+
+    const buffer = await this.downloadFile(downloadUrl);
+    if (buffer.byteLength > this.maxFileBytes) {
+      return {
+        file: resolved,
+        label,
+        mimeType,
+        status: "skipped_oversize",
+        contentBlocks: [
+          {
+            type: "text",
+            text: `Attachment note: ${label} exceeded the ${this.maxFileBytes} byte limit after download.`,
+          },
+        ],
+      };
+    }
+
+    return {
+      file: resolved,
+      label,
+      mimeType,
+      status: "ready",
+      contentBytes: buffer,
+      contentBlocks: buildClaudeContentBlocksForDocument(label, mimeType, buffer),
+    };
   }
 
   private async resolveFile(file: SlackFileReference): Promise<SlackFileReference> {
@@ -90,37 +221,7 @@ export class SlackFilesClient {
     };
   }
 
-  private async toContentBlocks(file: SlackFileReference): Promise<ClaudeInputBlock[]> {
-    const label = file.name ?? file.title ?? file.id;
-
-    if (file.isExternal && file.externalUrl) {
-      return [
-        {
-          type: "text",
-          text: `Attached external file: ${label}. URL: ${file.externalUrl}`,
-        },
-      ];
-    }
-
-    if (file.size && file.size > this.maxFileBytes) {
-      return [
-        {
-          type: "text",
-          text: `Attachment note: ${label} was skipped because it is larger than ${this.maxFileBytes} bytes.`,
-        },
-      ];
-    }
-
-    const downloadUrl = file.urlPrivateDownload ?? file.urlPrivate;
-    if (!downloadUrl) {
-      return [
-        {
-          type: "text",
-          text: `Attachment note: ${label} did not include a downloadable URL.`,
-        },
-      ];
-    }
-
+  private async downloadFile(downloadUrl: string): Promise<Buffer> {
     const token = await this.tokenProvider();
     const response = await fetch(downloadUrl, {
       method: "GET",
@@ -135,112 +236,6 @@ export class SlackFilesClient {
       );
     }
 
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    if (buffer.byteLength > this.maxFileBytes) {
-      return [
-        {
-          type: "text",
-          text: `Attachment note: ${label} exceeded the ${this.maxFileBytes} byte limit after download.`,
-        },
-      ];
-    }
-
-    const mimeType = file.mimetype ?? inferMimeTypeFromName(file.name);
-
-    if (mimeType === "application/pdf") {
-      return [
-        {
-          type: "document",
-          title: label,
-          source: {
-            type: "base64",
-            media_type: "application/pdf",
-            data: buffer.toString("base64"),
-          },
-        },
-      ];
-    }
-
-    if (mimeType && mimeType.startsWith("image/")) {
-      return [
-        {
-          type: "text",
-          text: `Attached image: ${label}`,
-        },
-        {
-          type: "image",
-          source: {
-            type: "base64",
-            media_type: mimeType,
-            data: buffer.toString("base64"),
-          },
-        },
-      ];
-    }
-
-    if (isTextLikeMimeType(mimeType)) {
-      return [
-        {
-          type: "document",
-          title: label,
-          source: {
-            type: "text",
-            media_type: "text/plain",
-            data: buffer.toString("utf-8"),
-          },
-        },
-      ];
-    }
-
-    return [
-      {
-        type: "text",
-        text: `Attachment note: ${label} (${mimeType ?? "unknown mime type"}) is not yet supported for inline analysis.`,
-      },
-    ];
+    return Buffer.from(await response.arrayBuffer());
   }
-}
-
-function inferMimeTypeFromName(name?: string): string | undefined {
-  if (!name) {
-    return undefined;
-  }
-
-  const lower = name.toLowerCase();
-  if (lower.endsWith(".pdf")) {
-    return "application/pdf";
-  }
-  if (lower.endsWith(".png")) {
-    return "image/png";
-  }
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
-    return "image/jpeg";
-  }
-  if (lower.endsWith(".webp")) {
-    return "image/webp";
-  }
-  if (lower.endsWith(".gif")) {
-    return "image/gif";
-  }
-  if (lower.endsWith(".txt") || lower.endsWith(".md") || lower.endsWith(".csv")) {
-    return "text/plain";
-  }
-  if (lower.endsWith(".json")) {
-    return "application/json";
-  }
-  return undefined;
-}
-
-function isTextLikeMimeType(mimeType?: string): boolean {
-  if (!mimeType) {
-    return false;
-  }
-
-  return (
-    mimeType.startsWith("text/") ||
-    mimeType === "application/json" ||
-    mimeType === "application/xml" ||
-    mimeType === "application/javascript"
-  );
 }

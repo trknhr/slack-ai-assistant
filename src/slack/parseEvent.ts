@@ -89,6 +89,7 @@ function buildQueueMessage(
     workspaceId,
     channelId,
     threadTs,
+    messageTs: eventTs,
     userId,
     text: normalizedText || "Please analyze the attached file(s).",
     source,

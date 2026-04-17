@@ -6,6 +6,7 @@ export const slackQueueMessageSchema = z.object({
   workspaceId: z.string().min(1),
   channelId: z.string().min(1),
   threadTs: z.string().min(1),
+  messageTs: z.string().min(1),
   userId: z.string().min(1),
   text: z.string().min(1),
   source: z.enum(["app_mention", "dm"]),
