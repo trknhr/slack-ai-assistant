@@ -13,6 +13,8 @@ export type SourceDocumentStatus =
   | "download_failed"
   | "archive_failed";
 
+export type SourceExtractionStatus = "queued" | "processing" | "extracted" | "failed";
+
 export interface SourceDocument {
   sourceId: string;
   workspaceId: string;
@@ -35,6 +37,12 @@ export interface SourceDocument {
   importedTaskIds?: string[];
   savedMemoryIds?: string[];
   errorMessage?: string;
+  extractionStatus?: SourceExtractionStatus;
+  extractionErrorMessage?: string;
+  extractedMarkdownS3Bucket?: string;
+  extractedMarkdownS3Key?: string;
+  extractedMarkdownChecksum?: string;
+  extractedMarkdownSize?: number;
   createdAt: string;
   updatedAt: string;
 }

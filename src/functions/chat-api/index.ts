@@ -1,12 +1,15 @@
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
 import { SecretsProvider } from "../../aws/secretsProvider";
+import { GoogleCalendarClient } from "../../calendar/googleCalendarClient";
 import { chatMessageRequestSchema } from "../../chat/contracts";
 import { AnthropicManagedAgentsClient } from "../../claude/client";
 import { createSession } from "../../claude/createSession";
 import { sendUserMessage } from "../../claude/sendUserMessage";
 import { waitForCompletion } from "../../claude/waitForCompletion";
 import { loadChatApiEnv } from "../../config/env";
+import { MEMORY_RESOURCE_PROMPT } from "../../memory/instructions";
 import { MemoryStoreService } from "../../memory/getOrCreateMemoryStore";
+import { CalendarDraftRepository } from "../../repo/calendarDraftRepository";
 import { MemoryItemRepository } from "../../repo/memoryItemRepository";
 import { TaskEventRepository } from "../../repo/taskEventRepository";
 import { TaskStateRepository } from "../../repo/taskStateRepository";
@@ -19,6 +22,11 @@ const secretsProvider = new SecretsProvider();
 const claudeClient = new AnthropicManagedAgentsClient({
   apiKeyProvider: () => secretsProvider.getSecretString(env.ANTHROPIC_API_KEY_SECRET_ID),
   beta: env.ANTHROPIC_MANAGED_AGENTS_BETA,
+});
+const calendarDraftRepository = new CalendarDraftRepository(env.CALENDAR_DRAFTS_TABLE_NAME);
+const googleCalendarClient = new GoogleCalendarClient({
+  secretProvider: () => secretsProvider.getSecretString(env.GOOGLE_CALENDAR_SECRET_ID),
+  defaultTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
 });
 const memoryItemRepository = new MemoryItemRepository(env.MEMORY_ITEMS_TABLE_NAME);
 const taskEventRepository = new TaskEventRepository(env.TASK_EVENTS_TABLE_NAME);
@@ -69,7 +77,7 @@ async function postMessage(
         {
           memoryStoreId: memoryStore.memoryStoreId,
           access: "read_write",
-          prompt: "User preferences and durable project context. Check before you answer.",
+          prompt: MEMORY_RESOURCE_PROMPT,
         },
       ];
     }
@@ -98,11 +106,16 @@ async function postMessage(
       memoryItems: memoryItemRepository,
       tasks: taskStateRepository,
       taskEvents: taskEventRepository,
+      calendarDrafts: calendarDraftRepository,
     },
     {
       workspaceId: input.workspaceId,
       userId: input.userId,
       logger: log,
+    },
+    {
+      googleCalendar: googleCalendarClient,
+      defaultCalendarTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
     },
   );
 

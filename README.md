@@ -10,7 +10,7 @@ This repository provides the application glue around Managed Agents:
 - session mapping and event deduplication
 - attachment handling for PDFs, images, and text files
 - raw Slack attachment archival to private S3 storage
-- custom tool execution backed by DynamoDB for memories and tasks
+- custom tool execution backed by DynamoDB for memories, tasks, and calendar drafts
 
 The goal is to keep reasoning and sandboxing inside Claude Managed Agents while handling webhooks, state, and integrations in AWS.
 
@@ -56,11 +56,11 @@ Raw attachment archive
 - `scheduled-agent-runner` Lambda
 - API Gateway
 - SQS + DLQ
-- 8 DynamoDB tables
+- 9 DynamoDB tables
 - private S3 bucket for supported Slack attachments
 - EventBridge Scheduler
 - Claude Managed Agents session + event loop integration
-- custom tool execution loop for memory and task persistence
+- custom tool execution loop for memory, task, and calendar draft persistence
 - local bulk import for `pdf`, `jpg/jpeg`, and `png`
 
 ## DynamoDB tables
@@ -79,6 +79,8 @@ Raw attachment archive
   Stores current task state
 - `TaskEventsTable`
   Stores task history
+- `CalendarDraftsTable`
+  Stores reviewable Google Calendar event drafts before they are applied
 - `SourceDocumentsTable`
   Stores archived Slack attachment metadata and archive status
 
@@ -108,9 +110,22 @@ src/
    - `/slack-ai-assistant/slack-signing-secret`
    - `/slack-ai-assistant/slack-bot-token`
    - `/slack-ai-assistant/anthropic-api-key`
+   - `/slack-ai-assistant/google-calendar`
 2. Prepare a Claude Managed Agent `agent_id` and `environment_id`
 3. If your MCP setup requires it, prepare one or more `vault_ids`
 4. Bootstrap CDK in the target AWS account and region
+
+Google Calendar secret JSON for the current MVP:
+
+```json
+{
+  "client_id": "YOUR_GOOGLE_OAUTH_CLIENT_ID",
+  "client_secret": "YOUR_GOOGLE_OAUTH_CLIENT_SECRET",
+  "refresh_token": "YOUR_GOOGLE_REFRESH_TOKEN",
+  "calendar_id": "primary",
+  "time_zone": "Asia/Tokyo"
+}
+```
 
 ## Deploy
 
@@ -127,6 +142,7 @@ Notes:
 
 - `defaultScheduleChannel` lets the scheduled runner create a fallback task automatically if `daily-summary` is missing.
 - `anthropicVaultIds` accepts a comma-separated list.
+- `googleCalendarSecretName` and `googleCalendarTimeZone` can be overridden with CDK context if needed.
 
 ## Sync custom tools to the Managed Agent
 
@@ -144,6 +160,33 @@ Optional overrides:
 - `ANTHROPIC_API_KEY_SECRET_ID`
 - `ANTHROPIC_MANAGED_AGENTS_BETA`
 - `ANTHROPIC_CUSTOM_TOOLS_FILE`
+
+## Google Calendar draft flow
+
+The MVP integrates Google Calendar as custom tools behind the existing Lambda executor.
+
+Available tools:
+
+- `list_calendar_events`
+- `find_free_busy`
+- `create_calendar_draft`
+- `list_calendar_drafts`
+- `apply_calendar_draft`
+- `discard_calendar_draft`
+
+Recommended flow:
+
+1. Extract event candidates from Slack or imported documents.
+2. Save them with `create_calendar_draft`.
+3. Show the returned draft preview to the user.
+4. Only after explicit approval, call `apply_calendar_draft`.
+
+Notes:
+
+- The app uses the Google Calendar REST API directly from Lambda.
+- The current MVP connects one Google account through a single refresh-token secret.
+- All-day events use date-only values and are written with Google Calendar's exclusive end-date semantics under the hood.
+- Draft application is idempotent across re-imports by storing app-specific private extended properties on events.
 
 ## Local bulk import
 
@@ -187,6 +230,41 @@ Security:
 - `imports/*` endpoints use `AWS_IAM` authorization.
 - The local script signs requests with SigV4 using your current AWS credentials.
 - Your IAM principal must have `execute-api:Invoke` permission for the import routes.
+
+## PDF to Markdown extraction
+
+For OCR and layout evaluation, you can queue a Markdown extraction pass for uploaded PDFs without ingesting them into memories or tasks.
+
+API routes:
+
+- `POST /imports/extractions/markdown`
+- `GET /imports/workspaces/{workspaceId}/sources/{sourceId}`
+- `GET /imports/workspaces/{workspaceId}/sources/{sourceId}/markdown`
+
+Flow:
+
+1. Upload the original PDF through `/imports/uploads`.
+2. Queue Markdown extraction through `/imports/extractions/markdown`.
+3. Poll `/imports/workspaces/{workspaceId}/sources/{sourceId}` until `extractionStatus` becomes `extracted`.
+4. Download the extracted Markdown through `/imports/workspaces/{workspaceId}/sources/{sourceId}/markdown`.
+
+Example CLI:
+
+```bash
+npm run extract-pdf-markdown -- \
+  --api-base-url https://YOUR_API_ID.execute-api.ap-northeast-1.amazonaws.com/prod \
+  --workspace-id T0123456789 \
+  --user-id U0123456789 \
+  --region ap-northeast-1 \
+  --wait \
+  private-docs
+```
+
+Security:
+
+- These routes also use `AWS_IAM` authorization.
+- The CLI signs requests with SigV4 using your current AWS credentials.
+- Your IAM principal must have `execute-api:Invoke` permission for the extraction routes.
 
 ## Markdown ingestion
 

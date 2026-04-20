@@ -1,5 +1,9 @@
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
+import { CalendarDraft, CalendarDraftCandidate, CalendarDraftStatus } from "../calendar/calendarDraft";
+import { GoogleCalendarClient } from "../calendar/googleCalendarClient";
 import { ClaudeInputBlock, ClaudeSessionEvent } from "../claude/client";
+import { CalendarDraftRepository } from "../repo/calendarDraftRepository";
 import { MemoryItemRepository } from "../repo/memoryItemRepository";
 import { TaskEventRepository } from "../repo/taskEventRepository";
 import { TaskStateRepository } from "../repo/taskStateRepository";
@@ -44,6 +48,140 @@ const markTaskDoneSchema = z.object({
   completed_at: z.string().optional(),
 });
 
+const listCalendarEventsSchema = z.object({
+  calendar_id: z.string().min(1).optional(),
+  time_min: z.string().min(1).optional(),
+  time_max: z.string().min(1).optional(),
+  time_zone: z.string().min(1).optional(),
+  query: z.string().min(1).optional(),
+  limit: z.number().int().min(1).max(50).optional(),
+});
+
+const findFreeBusySchema = z.object({
+  calendar_ids: z.array(z.string().min(1)).optional(),
+  time_min: z.string().min(1),
+  time_max: z.string().min(1),
+  time_zone: z.string().min(1).optional(),
+});
+
+const calendarDraftCandidateSchema = z
+  .object({
+    candidate_id: z.string().min(1).optional(),
+    summary: z.string().min(1),
+    description: z.string().optional(),
+    location: z.string().optional(),
+    all_day: z.boolean().optional(),
+    start_date: z.string().optional(),
+    end_date: z.string().optional(),
+    start_at: z.string().optional(),
+    end_at: z.string().optional(),
+    time_zone: z.string().optional(),
+    source_text: z.string().optional(),
+    confidence: z.number().min(0).max(1).optional(),
+    dedupe_key: z.string().min(1).optional(),
+  })
+  .superRefine((value, ctx) => {
+    const hasDateOnly = Boolean(value.all_day || value.start_date || value.end_date);
+    const hasDateTime = Boolean(value.start_at || value.end_at);
+
+    if (hasDateOnly && hasDateTime) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Use either start_date/end_date for an all-day event or start_at/end_at for a timed event, not both.",
+      });
+      return;
+    }
+
+    if (hasDateOnly) {
+      if (!value.start_date || !isDateOnly(value.start_date)) {
+        ctx.addIssue({
+          code: "custom",
+          message: "All-day events require start_date in YYYY-MM-DD format.",
+          path: ["start_date"],
+        });
+      }
+      if (value.end_date && !isDateOnly(value.end_date)) {
+        ctx.addIssue({
+          code: "custom",
+          message: "end_date must be in YYYY-MM-DD format.",
+          path: ["end_date"],
+        });
+      }
+      if (value.start_date && value.end_date && value.end_date < value.start_date) {
+        ctx.addIssue({
+          code: "custom",
+          message: "end_date must be on or after start_date.",
+          path: ["end_date"],
+        });
+      }
+      return;
+    }
+
+    if (!value.start_at || !isRfc3339(value.start_at)) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Timed events require start_at as an RFC3339 timestamp.",
+        path: ["start_at"],
+      });
+    }
+    if (!value.end_at || !isRfc3339(value.end_at)) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Timed events require end_at as an RFC3339 timestamp.",
+        path: ["end_at"],
+      });
+    }
+    if (
+      value.start_at &&
+      value.end_at &&
+      isRfc3339(value.start_at) &&
+      isRfc3339(value.end_at) &&
+      Date.parse(value.end_at) <= Date.parse(value.start_at)
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "end_at must be after start_at.",
+        path: ["end_at"],
+      });
+    }
+  });
+
+const createCalendarDraftSchema = z.object({
+  title: z.string().min(1).optional(),
+  notes: z.string().optional(),
+  source_id: z.string().min(1).optional(),
+  source_ref: z.string().min(1).optional(),
+  calendar_id: z.string().min(1).optional(),
+  candidates: z.array(calendarDraftCandidateSchema).min(1).max(50),
+});
+
+const listCalendarDraftsSchema = z.object({
+  statuses: z.array(z.enum(["pending", "approved", "applied", "rejected"])).optional(),
+  limit: z.number().int().min(1).max(20).optional(),
+});
+
+const applyCalendarDraftSchema = z.object({
+  draft_id: z.string().min(1),
+  calendar_id: z.string().min(1).optional(),
+  candidate_ids: z.array(z.string().min(1)).optional(),
+});
+
+const discardCalendarDraftSchema = z.object({
+  draft_id: z.string().min(1),
+  candidate_ids: z.array(z.string().min(1)).optional(),
+});
+
+type CalendarDraftCandidateInput = z.infer<typeof calendarDraftCandidateSchema>;
+
+const DEFAULT_CALENDAR_TIME_ZONE = "Asia/Tokyo";
+const CALENDAR_PRIVATE_PROPERTY_KEYS = {
+  draftId: "slackai_draft",
+  candidateId: "slackai_candidate",
+  dedupeKey: "slackai_dedupe",
+  workspaceId: "slackai_workspace",
+  sourceId: "slackai_source",
+} as const;
+
 export interface ToolExecutionContext {
   workspaceId: string;
   userId?: string;
@@ -54,6 +192,12 @@ interface ToolRepositories {
   memoryItems: MemoryItemRepository;
   tasks: TaskStateRepository;
   taskEvents: TaskEventRepository;
+  calendarDrafts?: CalendarDraftRepository;
+}
+
+interface ToolIntegrations {
+  googleCalendar?: GoogleCalendarClient;
+  defaultCalendarTimeZone?: string;
 }
 
 export interface ToolExecutionResult {
@@ -73,6 +217,7 @@ export class CustomToolExecutor {
   constructor(
     private readonly repositories: ToolRepositories,
     private readonly context: ToolExecutionContext,
+    private readonly integrations: ToolIntegrations = {},
   ) {}
 
   async execute(toolUseEvent: ClaudeSessionEvent): Promise<ToolExecutionResult> {
@@ -99,6 +244,18 @@ export class CustomToolExecutor {
           return this.upsertTask(input);
         case "mark_task_done":
           return this.markTaskDone(input);
+        case "list_calendar_events":
+          return this.listCalendarEvents(input);
+        case "find_free_busy":
+          return this.findFreeBusy(input);
+        case "create_calendar_draft":
+          return this.createCalendarDraft(input);
+        case "list_calendar_drafts":
+          return this.listCalendarDrafts(input);
+        case "apply_calendar_draft":
+          return this.applyCalendarDraft(input);
+        case "discard_calendar_draft":
+          return this.discardCalendarDraft(input);
         default:
           return errorResult(`Unknown custom tool: ${toolName}`);
       }
@@ -140,12 +297,14 @@ export class CustomToolExecutor {
 
   private async saveMemory(input: Record<string, unknown>): Promise<ToolExecutionResult> {
     const parsed = saveMemorySchema.parse(input);
+    const entityKey = normalizeEntityKey(parsed.entity_key);
+    const tags = normalizeTags(parsed.tags);
     const memory = await this.repositories.memoryItems.save({
       workspaceId: this.context.workspaceId,
-      entityKey: parsed.entity_key,
+      entityKey,
       text: parsed.text,
       attributes: parsed.attributes,
-      tags: parsed.tags,
+      tags,
       importance: parsed.importance,
       sourceType: "agent",
       createdByUserId: this.context.userId,
@@ -157,6 +316,7 @@ export class CustomToolExecutor {
       memory_id: memory.memoryId,
       entity_key: memory.entityKey,
       text: memory.text,
+      tags: memory.tags ?? [],
       updated_at: memory.updatedAt,
     });
   }
@@ -257,6 +417,317 @@ export class CustomToolExecutor {
       completed_at: task.completedAt,
     });
   }
+
+  private async listCalendarEvents(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = listCalendarEventsSchema.parse(input);
+    const calendar = this.requireGoogleCalendar();
+    const timeMin = parsed.time_min ?? new Date().toISOString();
+    const timeMax = parsed.time_max ?? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    const result = await calendar.listEvents({
+      calendarId: parsed.calendar_id,
+      timeMin,
+      timeMax,
+      timeZone: parsed.time_zone ?? this.getDefaultCalendarTimeZone(),
+      query: parsed.query,
+      maxResults: parsed.limit,
+    });
+
+    return jsonResult({
+      count: result.events.length,
+      calendar_id: result.calendarId,
+      time_zone: result.timeZone,
+      events: result.events.map((event) => ({
+        event_id: event.id,
+        status: event.status,
+        summary: event.summary,
+        description: event.description,
+        location: event.location,
+        start: serializeGoogleEventTime(event.start),
+        end: serializeGoogleEventTime(event.end),
+        private_properties: event.extendedProperties?.private ?? {},
+        html_link: event.htmlLink,
+        updated_at: event.updated,
+      })),
+    });
+  }
+
+  private async findFreeBusy(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = findFreeBusySchema.parse(input);
+    const calendar = this.requireGoogleCalendar();
+    const result = await calendar.queryFreeBusy({
+      calendarIds: parsed.calendar_ids,
+      timeMin: parsed.time_min,
+      timeMax: parsed.time_max,
+      timeZone: parsed.time_zone ?? this.getDefaultCalendarTimeZone(),
+    });
+
+    return jsonResult({
+      time_min: result.timeMin,
+      time_max: result.timeMax,
+      time_zone: result.timeZone,
+      calendars: result.calendars,
+    });
+  }
+
+  private async createCalendarDraft(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = createCalendarDraftSchema.parse(input);
+    const draftRepository = this.requireCalendarDraftRepository();
+    const now = new Date().toISOString();
+    const draftId = `caldraft_${randomUUID()}`;
+    const candidates = parsed.candidates.map((candidate) =>
+      normalizeCalendarDraftCandidate(candidate, {
+        defaultTimeZone: this.getDefaultCalendarTimeZone(),
+        sourceId: parsed.source_id,
+        sourceRef: parsed.source_ref,
+      }),
+    );
+
+    const draft: CalendarDraft = {
+      draftId,
+      workspaceId: this.context.workspaceId,
+      userId: this.context.userId,
+      title: parsed.title?.trim() || parsed.source_ref || parsed.source_id || "Calendar draft",
+      notes: normalizeOptionalString(parsed.notes),
+      sourceId: normalizeOptionalString(parsed.source_id),
+      sourceRef: normalizeOptionalString(parsed.source_ref),
+      calendarId: normalizeOptionalString(parsed.calendar_id),
+      status: "pending",
+      candidates,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await draftRepository.save(draft);
+
+    return jsonResult({
+      saved: true,
+      draft_id: draft.draftId,
+      title: draft.title,
+      status: draft.status,
+      calendar_id: draft.calendarId,
+      candidate_count: draft.candidates.length,
+      candidates: draft.candidates.map(serializeCalendarDraftCandidate),
+      next_step: "Show this draft to the user and wait for explicit approval before apply_calendar_draft.",
+    });
+  }
+
+  private async listCalendarDrafts(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = listCalendarDraftsSchema.parse(input);
+    const draftRepository = this.requireCalendarDraftRepository();
+    const drafts = await draftRepository.list({
+      workspaceId: this.context.workspaceId,
+      userId: this.context.userId,
+      statuses: parsed.statuses as CalendarDraftStatus[] | undefined,
+      limit: parsed.limit,
+    });
+
+    return jsonResult({
+      count: drafts.length,
+      drafts: drafts.map((draft) => ({
+        draft_id: draft.draftId,
+        title: draft.title,
+        status: draft.status,
+        calendar_id: draft.calendarId,
+        source_id: draft.sourceId,
+        source_ref: draft.sourceRef,
+        created_at: draft.createdAt,
+        updated_at: draft.updatedAt,
+        candidate_count: draft.candidates.length,
+        candidates: draft.candidates.map(serializeCalendarDraftCandidate),
+      })),
+    });
+  }
+
+  private async applyCalendarDraft(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = applyCalendarDraftSchema.parse(input);
+    const draftRepository = this.requireCalendarDraftRepository();
+    const calendar = this.requireGoogleCalendar();
+    const draft = await draftRepository.get(this.context.workspaceId, this.context.userId, parsed.draft_id);
+    if (!draft) {
+      throw new Error(`Calendar draft ${parsed.draft_id} was not found`);
+    }
+
+    const requestedIds = parsed.candidate_ids ? new Set(parsed.candidate_ids) : null;
+    const selectedCandidates = draft.candidates.filter((candidate) =>
+      requestedIds ? requestedIds.has(candidate.candidateId) : candidate.status === "pending",
+    );
+    if (requestedIds && selectedCandidates.length !== requestedIds.size) {
+      throw new Error(`Some candidate_ids were not found in draft ${draft.draftId}`);
+    }
+    if (selectedCandidates.length === 0) {
+      throw new Error("No calendar draft candidates are ready to apply");
+    }
+    if (selectedCandidates.some((candidate) => candidate.status === "rejected")) {
+      throw new Error("Rejected calendar draft candidates cannot be applied");
+    }
+
+    const calendarId = parsed.calendar_id ?? draft.calendarId;
+    const appliedAt = new Date().toISOString();
+    const results: Array<{
+      candidate_id: string;
+      operation: "created" | "updated";
+      event_id: string;
+      html_link?: string;
+      summary: string;
+    }> = [];
+
+    const candidateIds = new Set(selectedCandidates.map((candidate) => candidate.candidateId));
+    const updatedCandidates: CalendarDraftCandidate[] = [];
+
+    for (const candidate of draft.candidates) {
+      if (!candidateIds.has(candidate.candidateId)) {
+        updatedCandidates.push(candidate);
+        continue;
+      }
+
+      const privateProperties = buildCalendarPrivateProperties(this.context.workspaceId, draft, candidate);
+      const existingEvent = await calendar.findEventByPrivateProperties({
+        calendarId,
+        privateProperties: {
+          [CALENDAR_PRIVATE_PROPERTY_KEYS.dedupeKey]: privateProperties[CALENDAR_PRIVATE_PROPERTY_KEYS.dedupeKey],
+          [CALENDAR_PRIVATE_PROPERTY_KEYS.candidateId]: privateProperties[CALENDAR_PRIVATE_PROPERTY_KEYS.candidateId],
+        },
+      });
+      const body = buildGoogleCalendarEventBody(candidate, privateProperties, this.getDefaultCalendarTimeZone());
+      const appliedEvent = existingEvent?.id
+        ? await calendar.patchEvent({
+            calendarId,
+            eventId: existingEvent.id,
+            body,
+          })
+        : await calendar.createEvent({
+            calendarId,
+            body,
+          });
+
+      const operation: "created" | "updated" = existingEvent?.id ? "updated" : "created";
+      updatedCandidates.push({
+        ...candidate,
+        status: "applied",
+        calendarEventId: appliedEvent.id,
+        calendarEventHtmlLink: appliedEvent.htmlLink,
+        appliedAt,
+      });
+      results.push({
+        candidate_id: candidate.candidateId,
+        operation,
+        event_id: appliedEvent.id,
+        html_link: appliedEvent.htmlLink,
+        summary: appliedEvent.summary ?? candidate.summary,
+      });
+    }
+
+    const updatedDraft: CalendarDraft = {
+      ...draft,
+      calendarId,
+      status: resolveCalendarDraftStatus(updatedCandidates),
+      candidates: updatedCandidates,
+      approvedAt: draft.approvedAt ?? appliedAt,
+      lastAppliedAt: appliedAt,
+      updatedAt: appliedAt,
+      rejectedAt:
+        updatedCandidates.every((candidate) => candidate.status === "rejected")
+          ? draft.rejectedAt ?? appliedAt
+          : draft.rejectedAt,
+    };
+    await draftRepository.save(updatedDraft);
+
+    return jsonResult({
+      applied: true,
+      draft_id: updatedDraft.draftId,
+      status: updatedDraft.status,
+      calendar_id: updatedDraft.calendarId,
+      event_count: results.length,
+      events: results,
+      remaining_pending_candidate_ids: updatedDraft.candidates
+        .filter((candidate) => candidate.status === "pending")
+        .map((candidate) => candidate.candidateId),
+    });
+  }
+
+  private async discardCalendarDraft(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = discardCalendarDraftSchema.parse(input);
+    const draftRepository = this.requireCalendarDraftRepository();
+    const draft = await draftRepository.get(this.context.workspaceId, this.context.userId, parsed.draft_id);
+    if (!draft) {
+      throw new Error(`Calendar draft ${parsed.draft_id} was not found`);
+    }
+
+    const requestedIds = parsed.candidate_ids ? new Set(parsed.candidate_ids) : null;
+    const candidateIds = new Set(
+      draft.candidates
+        .filter((candidate) => (requestedIds ? requestedIds.has(candidate.candidateId) : candidate.status === "pending"))
+        .map((candidate) => candidate.candidateId),
+    );
+    if (requestedIds && candidateIds.size !== requestedIds.size) {
+      throw new Error(`Some candidate_ids were not found in draft ${draft.draftId}`);
+    }
+    if (candidateIds.size === 0) {
+      throw new Error("No calendar draft candidates are ready to discard");
+    }
+
+    const rejectedAt = new Date().toISOString();
+    const rejectedCandidateIds: string[] = [];
+    const skippedCandidateIds: string[] = [];
+
+    const updatedCandidates = draft.candidates.map((candidate) => {
+      if (!candidateIds.has(candidate.candidateId)) {
+        return candidate;
+      }
+      if (candidate.status === "applied") {
+        skippedCandidateIds.push(candidate.candidateId);
+        return candidate;
+      }
+      rejectedCandidateIds.push(candidate.candidateId);
+      return {
+        ...candidate,
+        status: "rejected" as const,
+        rejectedAt,
+      };
+    });
+
+    const updatedDraft: CalendarDraft = {
+      ...draft,
+      status: resolveCalendarDraftStatus(updatedCandidates),
+      candidates: updatedCandidates,
+      rejectedAt:
+        updatedCandidates.every((candidate) => candidate.status === "rejected") || rejectedCandidateIds.length > 0
+          ? draft.rejectedAt ?? rejectedAt
+          : draft.rejectedAt,
+      updatedAt: rejectedAt,
+    };
+    await draftRepository.save(updatedDraft);
+
+    return jsonResult({
+      discarded: true,
+      draft_id: updatedDraft.draftId,
+      status: updatedDraft.status,
+      rejected_candidate_ids: rejectedCandidateIds,
+      skipped_candidate_ids: skippedCandidateIds,
+      remaining_pending_candidate_ids: updatedDraft.candidates
+        .filter((candidate) => candidate.status === "pending")
+        .map((candidate) => candidate.candidateId),
+    });
+  }
+
+  private requireGoogleCalendar(): GoogleCalendarClient {
+    if (!this.integrations.googleCalendar) {
+      throw new Error("Google Calendar integration is not configured");
+    }
+    return this.integrations.googleCalendar;
+  }
+
+  private requireCalendarDraftRepository(): CalendarDraftRepository {
+    if (!this.repositories.calendarDrafts) {
+      throw new Error("Calendar draft storage is not configured");
+    }
+    return this.repositories.calendarDrafts;
+  }
+
+  private getDefaultCalendarTimeZone(): string {
+    return this.integrations.defaultCalendarTimeZone ?? DEFAULT_CALENDAR_TIME_ZONE;
+  }
 }
 
 function jsonResult(payload: unknown): ToolExecutionResult {
@@ -280,4 +751,211 @@ function errorResult(message: string): ToolExecutionResult {
       },
     ],
   };
+}
+
+function normalizeEntityKey(value?: string): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, "-");
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeTags(tags?: string[]): string[] | undefined {
+  if (!tags || tags.length === 0) {
+    return undefined;
+  }
+
+  const normalized = [...new Set(tags.map((tag) => tag.trim().toLowerCase().replace(/\s+/g, "_")).filter(Boolean))];
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeCalendarDraftCandidate(
+  input: CalendarDraftCandidateInput,
+  context: {
+    defaultTimeZone: string;
+    sourceId?: string;
+    sourceRef?: string;
+  },
+): CalendarDraftCandidate {
+  const candidateId = normalizeOptionalString(input.candidate_id) ?? `calcand_${randomUUID()}`;
+  const summary = input.summary.trim();
+  const description = normalizeOptionalString(input.description);
+  const location = normalizeOptionalString(input.location);
+  const sourceText = normalizeOptionalString(input.source_text);
+  const timeZone = normalizeOptionalString(input.time_zone) ?? context.defaultTimeZone;
+  const allDay = Boolean(input.all_day || input.start_date || input.end_date);
+
+  if (allDay) {
+    const startDate = input.start_date!.trim();
+    const endDate = normalizeOptionalString(input.end_date) ?? startDate;
+    return {
+      candidateId,
+      summary,
+      description,
+      location,
+      allDay: true,
+      startDate,
+      endDate,
+      timeZone,
+      sourceText,
+      confidence: input.confidence,
+      dedupeKey:
+        normalizeOptionalString(input.dedupe_key) ??
+        buildCalendarCandidateDedupeKey({
+          summary,
+          location,
+          allDay: true,
+          startDate,
+          endDate,
+          sourceId: context.sourceId,
+          sourceRef: context.sourceRef,
+        }),
+      status: "pending",
+    };
+  }
+
+  return {
+    candidateId,
+    summary,
+    description,
+    location,
+    allDay: false,
+    startAt: input.start_at!.trim(),
+    endAt: input.end_at!.trim(),
+    timeZone,
+    sourceText,
+    confidence: input.confidence,
+    dedupeKey:
+      normalizeOptionalString(input.dedupe_key) ??
+      buildCalendarCandidateDedupeKey({
+        summary,
+        location,
+        allDay: false,
+        startAt: input.start_at!.trim(),
+        endAt: input.end_at!.trim(),
+        timeZone,
+        sourceId: context.sourceId,
+        sourceRef: context.sourceRef,
+      }),
+    status: "pending",
+  };
+}
+
+function buildCalendarCandidateDedupeKey(input: Record<string, unknown>): string {
+  const hash = createHash("sha256").update(JSON.stringify(input)).digest("hex");
+  return `dedupe_${hash.slice(0, 24)}`;
+}
+
+function buildCalendarPrivateProperties(
+  workspaceId: string,
+  draft: CalendarDraft,
+  candidate: CalendarDraftCandidate,
+): Record<string, string> {
+  return {
+    [CALENDAR_PRIVATE_PROPERTY_KEYS.draftId]: draft.draftId,
+    [CALENDAR_PRIVATE_PROPERTY_KEYS.candidateId]: candidate.candidateId,
+    [CALENDAR_PRIVATE_PROPERTY_KEYS.dedupeKey]: candidate.dedupeKey ?? candidate.candidateId,
+    [CALENDAR_PRIVATE_PROPERTY_KEYS.workspaceId]: workspaceId,
+    ...(draft.sourceId ? { [CALENDAR_PRIVATE_PROPERTY_KEYS.sourceId]: draft.sourceId } : {}),
+  };
+}
+
+function buildGoogleCalendarEventBody(
+  candidate: CalendarDraftCandidate,
+  privateProperties: Record<string, string>,
+  defaultTimeZone: string,
+): Record<string, unknown> {
+  return {
+    summary: candidate.summary,
+    description: candidate.description,
+    location: candidate.location,
+    start: candidate.allDay
+      ? {
+          date: candidate.startDate,
+        }
+      : {
+          dateTime: candidate.startAt,
+          timeZone: candidate.timeZone ?? defaultTimeZone,
+        },
+    end: candidate.allDay
+      ? {
+          date: buildExclusiveEndDate(candidate.startDate!, candidate.endDate),
+        }
+      : {
+          dateTime: candidate.endAt,
+          timeZone: candidate.timeZone ?? defaultTimeZone,
+        },
+    extendedProperties: {
+      private: privateProperties,
+    },
+  };
+}
+
+function buildExclusiveEndDate(startDate: string, endDate?: string): string {
+  const inclusiveEnd = endDate ?? startDate;
+  const date = new Date(`${inclusiveEnd}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + 1);
+  return date.toISOString().slice(0, 10);
+}
+
+function resolveCalendarDraftStatus(candidates: CalendarDraftCandidate[]): CalendarDraftStatus {
+  if (candidates.every((candidate) => candidate.status === "rejected")) {
+    return "rejected";
+  }
+  if (candidates.some((candidate) => candidate.status === "pending")) {
+    return candidates.some((candidate) => candidate.status === "applied") ? "approved" : "pending";
+  }
+  return "applied";
+}
+
+function serializeCalendarDraftCandidate(candidate: CalendarDraftCandidate): Record<string, unknown> {
+  return {
+    candidate_id: candidate.candidateId,
+    summary: candidate.summary,
+    description: candidate.description,
+    location: candidate.location,
+    all_day: candidate.allDay,
+    start_date: candidate.startDate,
+    end_date: candidate.endDate,
+    start_at: candidate.startAt,
+    end_at: candidate.endAt,
+    time_zone: candidate.timeZone,
+    source_text: candidate.sourceText,
+    confidence: candidate.confidence,
+    dedupe_key: candidate.dedupeKey,
+    status: candidate.status,
+    calendar_event_id: candidate.calendarEventId,
+    calendar_event_html_link: candidate.calendarEventHtmlLink,
+    applied_at: candidate.appliedAt,
+    rejected_at: candidate.rejectedAt,
+  };
+}
+
+function serializeGoogleEventTime(
+  value?: { date?: string; dateTime?: string; timeZone?: string },
+): Record<string, unknown> | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  return {
+    date: value.date,
+    date_time: value.dateTime,
+    time_zone: value.timeZone,
+  };
+}
+
+function normalizeOptionalString(value?: string): string | undefined {
+  const normalized = value?.trim();
+  return normalized ? normalized : undefined;
+}
+
+function isDateOnly(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function isRfc3339(value: string): boolean {
+  return !Number.isNaN(Date.parse(value));
 }

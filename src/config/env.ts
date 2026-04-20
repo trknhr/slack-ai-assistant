@@ -46,7 +46,13 @@ const ingressEnvSchema = baseEnvSchema.extend({
   SLACK_QUEUE_URL: requiredString,
 });
 
-const workerEnvSchema = baseEnvSchema.extend({
+const toolRuntimeEnvSchema = baseEnvSchema.extend({
+  CALENDAR_DRAFTS_TABLE_NAME: requiredString,
+  GOOGLE_CALENDAR_SECRET_ID: requiredString,
+  GOOGLE_CALENDAR_TIME_ZONE: requiredString.default("Asia/Tokyo"),
+});
+
+const workerEnvSchema = toolRuntimeEnvSchema.extend({
   SOURCE_DOCUMENTS_TABLE_NAME: requiredString,
   SLACK_ATTACHMENT_ARCHIVE_BUCKET_NAME: requiredString,
 });
@@ -57,14 +63,14 @@ const importApiEnvSchema = baseEnvSchema.extend({
   DOCUMENT_ARCHIVE_BUCKET_NAME: requiredString,
 });
 
-const importWorkerEnvSchema = baseEnvSchema.extend({
+const importWorkerEnvSchema = toolRuntimeEnvSchema.extend({
   SOURCE_DOCUMENTS_TABLE_NAME: requiredString,
   DOCUMENT_ARCHIVE_BUCKET_NAME: requiredString,
 });
 
-const chatApiEnvSchema = baseEnvSchema;
+const chatApiEnvSchema = toolRuntimeEnvSchema;
 
-const schedulerEnvSchema = baseEnvSchema;
+const schedulerEnvSchema = toolRuntimeEnvSchema;
 
 export type IngressEnv = z.infer<typeof ingressEnvSchema>;
 export type WorkerEnv = z.infer<typeof workerEnvSchema>;

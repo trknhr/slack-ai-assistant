@@ -1,12 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
-import { HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { loadImportApiEnv } from "../../config/env";
 import {
   createImportUploadRequestSchema,
   ingestMarkdownRequestSchema,
+  queueMarkdownExtractionRequestSchema,
   queueImportRequestSchema,
 } from "../../imports/contracts";
 import { SourceDocument } from "../../documents/sourceDocument";
@@ -36,11 +37,22 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return ingestMarkdown(event, log);
     }
 
+    if (event.httpMethod === "POST" && event.resource === "/imports/extractions/markdown") {
+      return queueMarkdownExtraction(event, log);
+    }
+
     if (
       event.httpMethod === "GET" &&
       event.resource === "/imports/workspaces/{workspaceId}/sources/{sourceId}"
     ) {
       return getSourceStatus(event);
+    }
+
+    if (
+      event.httpMethod === "GET" &&
+      event.resource === "/imports/workspaces/{workspaceId}/sources/{sourceId}/markdown"
+    ) {
+      return getExtractedMarkdown(event);
     }
 
     return response(404, { ok: false, error: "not_found" });
@@ -252,6 +264,65 @@ async function ingestMarkdown(
   });
 }
 
+async function queueMarkdownExtraction(
+  event: APIGatewayProxyEvent,
+  log: typeof logger,
+): Promise<APIGatewayProxyResult> {
+  const body = parseJsonBody(event);
+  const input = queueMarkdownExtractionRequestSchema.parse(body);
+  const existing = await sourceDocumentRepository.get(input.workspaceId, input.sourceId);
+  if (!existing) {
+    return response(404, { ok: false, error: "source_not_found" });
+  }
+
+  if (!existing.s3Key || !existing.s3Bucket) {
+    return response(400, { ok: false, error: "missing_archive_location" });
+  }
+
+  if (existing.mimeType !== "application/pdf") {
+    return response(400, {
+      ok: false,
+      error: "unsupported_mime_type",
+      supported: ["application/pdf"],
+    });
+  }
+
+  await s3.send(
+    new HeadObjectCommand({
+      Bucket: existing.s3Bucket,
+      Key: existing.s3Key,
+    }),
+  );
+
+  const now = new Date().toISOString();
+  await sourceDocumentRepository.save({
+    ...existing,
+    extractionStatus: "queued",
+    extractionErrorMessage: undefined,
+    updatedAt: now,
+  });
+
+  await enqueueDocumentImport(event.requestContext.requestId, {
+    workspaceId: input.workspaceId,
+    userId: input.userId,
+    sourceId: input.sourceId,
+    operation: "extract_markdown",
+    prompt: input.prompt,
+    queuedAt: now,
+  });
+
+  log.info("Markdown extraction queued", {
+    sourceId: input.sourceId,
+    workspaceId: input.workspaceId,
+  });
+
+  return response(202, {
+    ok: true,
+    sourceId: input.sourceId,
+    statusUrl: buildStatusUrl(event, input.workspaceId, input.sourceId),
+  });
+}
+
 async function getSourceStatus(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
   const workspaceId = event.pathParameters?.workspaceId;
   const sourceId = event.pathParameters?.sourceId;
@@ -264,7 +335,53 @@ async function getSourceStatus(event: APIGatewayProxyEvent): Promise<APIGatewayP
     return response(404, { ok: false, error: "source_not_found" });
   }
 
-  return response(200, source);
+  return response(200, {
+    ...source,
+    extractedMarkdownUrl:
+      source.extractionStatus === "extracted" && source.extractedMarkdownS3Key
+        ? buildExtractedMarkdownUrl(event, workspaceId, sourceId)
+        : undefined,
+  });
+}
+
+async function getExtractedMarkdown(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  const workspaceId = event.pathParameters?.workspaceId;
+  const sourceId = event.pathParameters?.sourceId;
+  if (!workspaceId || !sourceId) {
+    return response(400, { ok: false, error: "missing_path_parameters" });
+  }
+
+  const source = await sourceDocumentRepository.get(workspaceId, sourceId);
+  if (!source) {
+    return response(404, { ok: false, error: "source_not_found" });
+  }
+
+  if (
+    source.extractionStatus !== "extracted" ||
+    !source.extractedMarkdownS3Bucket ||
+    !source.extractedMarkdownS3Key
+  ) {
+    return response(404, { ok: false, error: "extracted_markdown_not_found" });
+  }
+
+  const object = await s3.send(
+    new GetObjectCommand({
+      Bucket: source.extractedMarkdownS3Bucket,
+      Key: source.extractedMarkdownS3Key,
+    }),
+  );
+  if (!object.Body) {
+    return response(500, { ok: false, error: "empty_markdown_body" });
+  }
+
+  const markdown = Buffer.from(await object.Body.transformToByteArray()).toString("utf-8");
+  return {
+    statusCode: 200,
+    headers: {
+      "content-type": "text/markdown; charset=utf-8",
+    },
+    body: markdown,
+  };
 }
 
 async function enqueueDocumentImport(
@@ -273,6 +390,7 @@ async function enqueueDocumentImport(
     workspaceId: string;
     userId: string;
     sourceId: string;
+    operation?: "import" | "extract_markdown";
     prompt?: string;
     queuedAt: string;
   },
@@ -286,6 +404,7 @@ async function enqueueDocumentImport(
         workspaceId: input.workspaceId,
         userId: input.userId,
         sourceId: input.sourceId,
+        operation: input.operation ?? "import",
         prompt: input.prompt,
         queuedAt: input.queuedAt,
       }),
@@ -332,6 +451,16 @@ function buildStatusUrl(event: APIGatewayProxyEvent, workspaceId: string, source
   return `https://${event.requestContext.domainName}/${event.requestContext.stage}/imports/workspaces/${encodeURIComponent(
     workspaceId,
   )}/sources/${encodeURIComponent(sourceId)}`;
+}
+
+function buildExtractedMarkdownUrl(
+  event: APIGatewayProxyEvent,
+  workspaceId: string,
+  sourceId: string,
+): string {
+  return `https://${event.requestContext.domainName}/${event.requestContext.stage}/imports/workspaces/${encodeURIComponent(
+    workspaceId,
+  )}/sources/${encodeURIComponent(sourceId)}/markdown`;
 }
 
 function parseJsonBody(event: APIGatewayProxyEvent): unknown {

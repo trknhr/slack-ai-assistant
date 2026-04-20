@@ -5,6 +5,9 @@ import { createSession } from "../../claude/createSession";
 import { sendUserMessage } from "../../claude/sendUserMessage";
 import { waitForCompletion } from "../../claude/waitForCompletion";
 import { loadWorkerEnv } from "../../config/env";
+import { MEMORY_RESOURCE_PROMPT } from "../../memory/instructions";
+import { GoogleCalendarClient } from "../../calendar/googleCalendarClient";
+import { CalendarDraftRepository } from "../../repo/calendarDraftRepository";
 import { MemoryStoreService } from "../../memory/getOrCreateMemoryStore";
 import { MemoryItemRepository } from "../../repo/memoryItemRepository";
 import { SessionRepository } from "../../repo/sessionRepository";
@@ -32,6 +35,11 @@ const slackFilesClient = new SlackFilesClient(
   () => secretsProvider.getSecretString(env.SLACK_BOT_TOKEN_SECRET_ID),
   env.MAX_SLACK_FILE_BYTES,
 );
+const calendarDraftRepository = new CalendarDraftRepository(env.CALENDAR_DRAFTS_TABLE_NAME);
+const googleCalendarClient = new GoogleCalendarClient({
+  secretProvider: () => secretsProvider.getSecretString(env.GOOGLE_CALENDAR_SECRET_ID),
+  defaultTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
+});
 const memoryItemRepository = new MemoryItemRepository(env.MEMORY_ITEMS_TABLE_NAME);
 const sessionRepository = new SessionRepository(env.SESSION_TABLE_NAME);
 const sourceDocumentRepository = new SourceDocumentRepository(env.SOURCE_DOCUMENTS_TABLE_NAME);
@@ -95,7 +103,7 @@ export async function handler(event: SQSEvent): Promise<void> {
               {
                 memoryStoreId,
                 access: "read_write",
-                prompt: "User preferences and durable project context. Check before you answer.",
+                prompt: MEMORY_RESOURCE_PROMPT,
               },
             ]
           : [],
@@ -127,11 +135,16 @@ export async function handler(event: SQSEvent): Promise<void> {
         memoryItems: memoryItemRepository,
         tasks: taskStateRepository,
         taskEvents: taskEventRepository,
+        calendarDrafts: calendarDraftRepository,
       },
       {
         workspaceId: queueMessage.workspaceId,
         userId: queueMessage.userId,
         logger: log,
+      },
+      {
+        googleCalendar: googleCalendarClient,
+        defaultCalendarTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
       },
     );
 

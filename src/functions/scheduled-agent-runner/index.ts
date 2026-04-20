@@ -1,10 +1,13 @@
 import type { EventBridgeEvent } from "aws-lambda";
 import { SecretsProvider } from "../../aws/secretsProvider";
+import { GoogleCalendarClient } from "../../calendar/googleCalendarClient";
 import { AnthropicManagedAgentsClient } from "../../claude/client";
 import { createSession } from "../../claude/createSession";
 import { sendUserMessage } from "../../claude/sendUserMessage";
 import { waitForCompletion } from "../../claude/waitForCompletion";
 import { loadSchedulerEnv } from "../../config/env";
+import { SCHEDULED_MEMORY_RESOURCE_PROMPT } from "../../memory/instructions";
+import { CalendarDraftRepository } from "../../repo/calendarDraftRepository";
 import { MemoryItemRepository } from "../../repo/memoryItemRepository";
 import { SessionRepository } from "../../repo/sessionRepository";
 import { TaskEventRepository } from "../../repo/taskEventRepository";
@@ -26,6 +29,8 @@ interface SchedulerPayload {
   persistTask?: boolean;
 }
 
+const SCHEDULE_TIMEZONE = "Asia/Tokyo";
+
 const env = loadSchedulerEnv();
 const secretsProvider = new SecretsProvider();
 const claudeClient = new AnthropicManagedAgentsClient({
@@ -35,6 +40,11 @@ const claudeClient = new AnthropicManagedAgentsClient({
 const slackClient = new SlackWebClient(() =>
   secretsProvider.getSecretString(env.SLACK_BOT_TOKEN_SECRET_ID),
 );
+const calendarDraftRepository = new CalendarDraftRepository(env.CALENDAR_DRAFTS_TABLE_NAME);
+const googleCalendarClient = new GoogleCalendarClient({
+  secretProvider: () => secretsProvider.getSecretString(env.GOOGLE_CALENDAR_SECRET_ID),
+  defaultTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
+});
 const slackAuthClient = new SlackAuthClient(() =>
   secretsProvider.getSecretString(env.SLACK_BOT_TOKEN_SECRET_ID),
 );
@@ -49,6 +59,7 @@ export async function handler(
 ): Promise<void> {
   const detail = "detail" in event ? event.detail : event;
   const taskId = detail.taskId ?? "daily-summary";
+  const scheduledAtIso = resolveScheduledAtIso(event);
   const log = logger.child({ component: "scheduled-agent-runner", taskId });
 
   let task = await taskRepository.get(taskId);
@@ -89,7 +100,7 @@ export async function handler(
             {
               memoryStoreId: task.memoryStoreId,
               access: "read_write",
-              prompt: "Shared durable memory for this scheduled task.",
+              prompt: SCHEDULED_MEMORY_RESOURCE_PROMPT,
             },
           ]
         : [],
@@ -105,10 +116,15 @@ export async function handler(
       memoryItems: memoryItemRepository,
       tasks: taskStateRepository,
       taskEvents: taskEventRepository,
+      calendarDrafts: calendarDraftRepository,
     },
     {
       workspaceId: task.workspaceId,
       logger: log,
+    },
+    {
+      googleCalendar: googleCalendarClient,
+      defaultCalendarTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
     },
   );
 
@@ -117,7 +133,7 @@ export async function handler(
     content: [
       {
         type: "text",
-        text: task.prompt,
+        text: buildScheduledPrompt(task.prompt, scheduledAtIso),
       },
     ],
   });
@@ -209,4 +225,62 @@ function resolveVaultIds(
   }
 
   return env.ANTHROPIC_VAULT_IDS;
+}
+
+function resolveScheduledAtIso(
+  event: EventBridgeEvent<string, SchedulerPayload> | SchedulerPayload,
+): string {
+  if ("time" in event && typeof event.time === "string" && event.time.length > 0) {
+    return event.time;
+  }
+
+  return new Date().toISOString();
+}
+
+function buildScheduledPrompt(basePrompt: string, scheduledAtIso: string): string {
+  const date = new Date(scheduledAtIso);
+  if (Number.isNaN(date.getTime())) {
+    return basePrompt;
+  }
+
+  const parts = formatInTimeZone(date, SCHEDULE_TIMEZONE);
+  return [
+    "Scheduling context:",
+    `- Current scheduled run time: ${parts.date} ${parts.time} (${parts.weekday})`,
+    `- Time zone: ${SCHEDULE_TIMEZONE}`,
+    "- Interpret relative dates such as today, yesterday, and tomorrow using this time zone, not UTC.",
+    "",
+    basePrompt,
+  ].join("\n");
+}
+
+function formatInTimeZone(date: Date, timeZone: string): {
+  date: string;
+  time: string;
+  weekday: string;
+} {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    weekday: "long",
+    hourCycle: "h23",
+  });
+
+  const parts = Object.fromEntries(
+    formatter
+      .formatToParts(date)
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+
+  return {
+    date: `${parts.year}-${parts.month}-${parts.day}`,
+    time: `${parts.hour}:${parts.minute}:${parts.second}`,
+    weekday: parts.weekday,
+  };
 }

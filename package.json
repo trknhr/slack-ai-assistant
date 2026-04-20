@@ -13,6 +13,7 @@
     "sync-agent-tools": "ts-node scripts/sync-agent-tools.ts",
     "import-local-docs": "ts-node scripts/import-local-docs.ts",
     "ingest-markdown": "ts-node scripts/ingest-markdown.ts",
+    "extract-pdf-markdown": "ts-node scripts/extract-pdf-markdown.ts",
     "ask-agent": "ts-node scripts/ask-agent.ts"
   },
   "dependencies": {

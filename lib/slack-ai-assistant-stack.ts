@@ -30,6 +30,11 @@ export class SlackAiAssistantStack extends Stack {
     const anthropicApiKeySecretName =
       this.node.tryGetContext("anthropicApiKeySecretName") ??
       "/slack-ai-assistant/anthropic-api-key";
+    const googleCalendarSecretName =
+      this.node.tryGetContext("googleCalendarSecretName") ??
+      "/slack-ai-assistant/google-calendar";
+    const googleCalendarTimeZone =
+      this.node.tryGetContext("googleCalendarTimeZone") ?? "Asia/Tokyo";
     const defaultScheduleChannel =
       this.node.tryGetContext("defaultScheduleChannel") ?? "C_PLACEHOLDER";
 
@@ -72,6 +77,13 @@ export class SlackAiAssistantStack extends Stack {
       partitionKey: { name: "gsi1pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "gsi1sk", type: dynamodb.AttributeType.STRING },
       projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    const calendarDraftsTable = new dynamodb.Table(this, "CalendarDraftsTable", {
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
     });
 
     const taskEventsTable = new dynamodb.Table(this, "TaskEventsTable", {
@@ -153,6 +165,12 @@ export class SlackAiAssistantStack extends Stack {
       MAX_SLACK_FILE_BYTES: "10000000",
     };
 
+    const toolEnvironment = {
+      CALENDAR_DRAFTS_TABLE_NAME: calendarDraftsTable.tableName,
+      GOOGLE_CALENDAR_SECRET_ID: googleCalendarSecretName,
+      GOOGLE_CALENDAR_TIME_ZONE: googleCalendarTimeZone,
+    };
+
     const ingress = new nodejs.NodejsFunction(this, "SlackEventsIngressFunction", {
       runtime: lambda.Runtime.NODEJS_20_X,
       entry: join(__dirname, "../src/functions/slack-events-ingress/index.ts"),
@@ -176,6 +194,7 @@ export class SlackAiAssistantStack extends Stack {
       memorySize: 512,
       environment: {
         ...commonEnvironment,
+        ...toolEnvironment,
         SOURCE_DOCUMENTS_TABLE_NAME: sourceDocumentsTable.tableName,
         SLACK_ATTACHMENT_ARCHIVE_BUCKET_NAME: attachmentArchiveBucket.bucketName,
       },
@@ -209,6 +228,7 @@ export class SlackAiAssistantStack extends Stack {
       memorySize: 512,
       environment: {
         ...commonEnvironment,
+        ...toolEnvironment,
         SOURCE_DOCUMENTS_TABLE_NAME: sourceDocumentsTable.tableName,
         DOCUMENT_ARCHIVE_BUCKET_NAME: attachmentArchiveBucket.bucketName,
       },
@@ -223,7 +243,10 @@ export class SlackAiAssistantStack extends Stack {
       handler: "handler",
       timeout: Duration.seconds(29),
       memorySize: 512,
-      environment: commonEnvironment,
+      environment: {
+        ...commonEnvironment,
+        ...toolEnvironment,
+      },
       bundling: {
         target: "node20",
       },
@@ -235,7 +258,10 @@ export class SlackAiAssistantStack extends Stack {
       handler: "handler",
       timeout: Duration.minutes(5),
       memorySize: 512,
-      environment: commonEnvironment,
+      environment: {
+        ...commonEnvironment,
+        ...toolEnvironment,
+      },
       bundling: {
         target: "node20",
       },
@@ -270,6 +296,10 @@ export class SlackAiAssistantStack extends Stack {
     tasksTable.grantReadWriteData(scheduledRunner);
     tasksTable.grantReadWriteData(documentImportWorker);
     tasksTable.grantReadWriteData(chatApi);
+    calendarDraftsTable.grantReadWriteData(worker);
+    calendarDraftsTable.grantReadWriteData(scheduledRunner);
+    calendarDraftsTable.grantReadWriteData(documentImportWorker);
+    calendarDraftsTable.grantReadWriteData(chatApi);
     taskEventsTable.grantReadWriteData(worker);
     taskEventsTable.grantReadWriteData(scheduledRunner);
     taskEventsTable.grantReadWriteData(documentImportWorker);
@@ -280,8 +310,11 @@ export class SlackAiAssistantStack extends Stack {
     attachmentArchiveBucket.grantPut(worker, "raw/private/slack/*");
     attachmentArchiveBucket.grantPut(documentImportApi, "raw/private/imports/*");
     attachmentArchiveBucket.grantPut(documentImportApi, "raw/private/notes/*");
+    attachmentArchiveBucket.grantRead(documentImportApi, "raw/private/imports/*");
+    attachmentArchiveBucket.grantRead(documentImportApi, "derived/private/extractions/*");
     attachmentArchiveBucket.grantRead(documentImportWorker, "raw/private/imports/*");
     attachmentArchiveBucket.grantRead(documentImportWorker, "raw/private/notes/*");
+    attachmentArchiveBucket.grantPut(documentImportWorker, "derived/private/extractions/*");
 
     const slackSigningSecret = secretsmanager.Secret.fromSecretNameV2(
       this,
@@ -298,6 +331,11 @@ export class SlackAiAssistantStack extends Stack {
       "AnthropicApiKeySecret",
       anthropicApiKeySecretName,
     );
+    const googleCalendarSecret = secretsmanager.Secret.fromSecretNameV2(
+      this,
+      "GoogleCalendarSecret",
+      googleCalendarSecretName,
+    );
 
     slackSigningSecret.grantRead(ingress);
     slackBotTokenSecret.grantRead(worker);
@@ -306,6 +344,10 @@ export class SlackAiAssistantStack extends Stack {
     anthropicApiKeySecret.grantRead(scheduledRunner);
     anthropicApiKeySecret.grantRead(documentImportWorker);
     anthropicApiKeySecret.grantRead(chatApi);
+    googleCalendarSecret.grantRead(worker);
+    googleCalendarSecret.grantRead(scheduledRunner);
+    googleCalendarSecret.grantRead(documentImportWorker);
+    googleCalendarSecret.grantRead(chatApi);
 
     const api = new apigateway.RestApi(this, "SlackEventsApi", {
       restApiName: "slack-ai-assistant-events",
@@ -327,13 +369,22 @@ export class SlackAiAssistantStack extends Stack {
       authorizationType: apigateway.AuthorizationType.IAM,
     });
     importsResource
+      .addResource("extractions")
+      .addResource("markdown")
+      .addMethod("POST", new apigateway.LambdaIntegration(documentImportApi), {
+        authorizationType: apigateway.AuthorizationType.IAM,
+      });
+    const importSourceResource = importsResource
       .addResource("workspaces")
       .addResource("{workspaceId}")
       .addResource("sources")
-      .addResource("{sourceId}")
-      .addMethod("GET", new apigateway.LambdaIntegration(documentImportApi), {
-        authorizationType: apigateway.AuthorizationType.IAM,
-      });
+      .addResource("{sourceId}");
+    importSourceResource.addMethod("GET", new apigateway.LambdaIntegration(documentImportApi), {
+      authorizationType: apigateway.AuthorizationType.IAM,
+    });
+    importSourceResource.addResource("markdown").addMethod("GET", new apigateway.LambdaIntegration(documentImportApi), {
+      authorizationType: apigateway.AuthorizationType.IAM,
+    });
     api.root
       .addResource("chat")
       .addResource("messages")
@@ -401,6 +452,9 @@ export class SlackAiAssistantStack extends Stack {
     });
     new cdk.CfnOutput(this, "TaskEventsTableName", {
       value: taskEventsTable.tableName,
+    });
+    new cdk.CfnOutput(this, "CalendarDraftsTableName", {
+      value: calendarDraftsTable.tableName,
     });
     new cdk.CfnOutput(this, "SlackAttachmentArchiveBucketName", {
       value: attachmentArchiveBucket.bucketName,
