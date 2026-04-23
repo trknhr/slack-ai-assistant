@@ -181,6 +181,11 @@ const CALENDAR_PRIVATE_PROPERTY_KEYS = {
   workspaceId: "slackai_workspace",
   sourceId: "slackai_source",
 } as const;
+const CALENDAR_TOOL_NAMES = new Set([
+  "list_calendar_events",
+  "find_free_busy",
+  "apply_calendar_draft",
+]);
 
 export interface ToolExecutionContext {
   workspaceId: string;
@@ -235,32 +240,42 @@ export class CustomToolExecutor {
     try {
       switch (toolName) {
         case "search_memories":
-          return this.searchMemories(input);
+          return await this.searchMemories(input);
         case "save_memory":
-          return this.saveMemory(input);
+          return await this.saveMemory(input);
         case "list_tasks":
-          return this.listTasks(input);
+          return await this.listTasks(input);
         case "upsert_task":
-          return this.upsertTask(input);
+          return await this.upsertTask(input);
         case "mark_task_done":
-          return this.markTaskDone(input);
+          return await this.markTaskDone(input);
         case "list_calendar_events":
-          return this.listCalendarEvents(input);
+          return await this.listCalendarEvents(input);
         case "find_free_busy":
-          return this.findFreeBusy(input);
+          return await this.findFreeBusy(input);
         case "create_calendar_draft":
-          return this.createCalendarDraft(input);
+          return await this.createCalendarDraft(input);
         case "list_calendar_drafts":
-          return this.listCalendarDrafts(input);
+          return await this.listCalendarDrafts(input);
         case "apply_calendar_draft":
-          return this.applyCalendarDraft(input);
+          return await this.applyCalendarDraft(input);
         case "discard_calendar_draft":
-          return this.discardCalendarDraft(input);
+          return await this.discardCalendarDraft(input);
         default:
           return errorResult(`Unknown custom tool: ${toolName}`);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown tool execution error";
+      this.context.logger.warn("Custom tool execution failed", {
+        toolName,
+        toolEventId: toolUseEvent.id,
+        error: message,
+      });
+      if (CALENDAR_TOOL_NAMES.has(toolName)) {
+        return errorResult(
+          `Google Calendar is unavailable. Skip calendar-dependent work for this request and continue without calendar data. Details: ${message}`,
+        );
+      }
       return errorResult(message);
     }
   }
