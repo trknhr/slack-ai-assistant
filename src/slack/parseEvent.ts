@@ -55,6 +55,14 @@ export function extractSlackQueueMessage(
   if (type === "message" && channelType === "im") {
     return buildQueueMessage(event, envelope.event_id, workspaceId, correlationId, "dm");
   }
+  if (
+    type === "message" &&
+    typeof event.thread_ts === "string" &&
+    event.thread_ts.length > 0 &&
+    channelType !== "im"
+  ) {
+    return buildQueueMessage(event, envelope.event_id, workspaceId, correlationId, "thread_reply");
+  }
 
   return null;
 }
@@ -64,7 +72,7 @@ function buildQueueMessage(
   eventId: string,
   workspaceId: string,
   correlationId: string,
-  source: "app_mention" | "dm",
+  source: "app_mention" | "dm" | "thread_reply",
 ): SlackQueueMessage | null {
   const text = typeof event.text === "string" ? event.text : "";
   const channelId = typeof event.channel === "string" ? event.channel : "";

@@ -9,7 +9,7 @@ export const slackQueueMessageSchema = z.object({
   messageTs: z.string().min(1),
   userId: z.string().min(1),
   text: z.string().min(1),
-  source: z.enum(["app_mention", "dm"]),
+  source: z.enum(["app_mention", "dm", "thread_reply"]),
   receivedAt: z.string().min(1),
   files: z
     .array(

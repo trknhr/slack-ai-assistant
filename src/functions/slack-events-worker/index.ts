@@ -67,6 +67,14 @@ export async function handler(event: SQSEvent): Promise<void> {
       queueMessage.channelId,
       queueMessage.threadTs,
     );
+    if (queueMessage.source === "thread_reply" && !existingSession) {
+      log.info("Slack thread reply ignored because no assistant session exists", {
+        channelId: queueMessage.channelId,
+        threadTs: queueMessage.threadTs,
+        messageTs: queueMessage.messageTs,
+      });
+      continue;
+    }
 
     let memoryStoreId = existingSession?.memoryStoreId;
     if (env.ENABLE_USER_MEMORY) {
