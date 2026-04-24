@@ -17,26 +17,35 @@ export class SlackAiAssistantStack extends Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const anthropicAgentId = this.node.tryGetContext("anthropicAgentId") ?? "agent_placeholder";
-    const anthropicEnvironmentId =
-      this.node.tryGetContext("anthropicEnvironmentId") ?? "env_placeholder";
-    const anthropicVaultIds = this.node.tryGetContext("anthropicVaultIds") ?? "";
+    const anthropicAgentId = resolveRequiredConfigValue(
+      this,
+      "anthropicAgentId",
+      "ANTHROPIC_AGENT_ID",
+    );
+    const anthropicEnvironmentId = resolveRequiredConfigValue(
+      this,
+      "anthropicEnvironmentId",
+      "ANTHROPIC_ENVIRONMENT_ID",
+    );
+    const anthropicVaultIds =
+      resolveOptionalConfigValue(this, "anthropicVaultIds", "ANTHROPIC_VAULT_IDS") ?? "";
     const slackSigningSecretName =
-      this.node.tryGetContext("slackSigningSecretName") ??
+      resolveOptionalConfigValue(this, "slackSigningSecretName", "SLACK_SIGNING_SECRET_NAME") ??
       "/slack-ai-assistant/slack-signing-secret";
     const slackBotTokenSecretName =
-      this.node.tryGetContext("slackBotTokenSecretName") ??
+      resolveOptionalConfigValue(this, "slackBotTokenSecretName", "SLACK_BOT_TOKEN_SECRET_NAME") ??
       "/slack-ai-assistant/slack-bot-token";
     const anthropicApiKeySecretName =
-      this.node.tryGetContext("anthropicApiKeySecretName") ??
+      resolveOptionalConfigValue(this, "anthropicApiKeySecretName", "ANTHROPIC_API_KEY_SECRET_NAME") ??
       "/slack-ai-assistant/anthropic-api-key";
     const googleCalendarSecretName =
-      this.node.tryGetContext("googleCalendarSecretName") ??
+      resolveOptionalConfigValue(this, "googleCalendarSecretName", "GOOGLE_CALENDAR_SECRET_NAME") ??
       "/slack-ai-assistant/google-calendar";
     const googleCalendarTimeZone =
-      this.node.tryGetContext("googleCalendarTimeZone") ?? "Asia/Tokyo";
+      resolveOptionalConfigValue(this, "googleCalendarTimeZone", "GOOGLE_CALENDAR_TIME_ZONE") ?? "Asia/Tokyo";
     const defaultScheduleChannel =
-      this.node.tryGetContext("defaultScheduleChannel") ?? "C_PLACEHOLDER";
+      resolveOptionalConfigValue(this, "defaultScheduleChannel", "DEFAULT_SCHEDULE_CHANNEL") ??
+      "C_PLACEHOLDER";
 
     const sessionTable = new dynamodb.Table(this, "SlackThreadSessionsTable", {
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
@@ -492,4 +501,53 @@ export class SlackAiAssistantStack extends Stack {
       value: attachmentArchiveBucket.bucketName,
     });
   }
+}
+
+function resolveRequiredConfigValue(stack: Stack, contextKey: string, envVarName: string): string {
+  const value = resolveOptionalConfigValue(stack, contextKey, envVarName);
+  if (!value) {
+    throw new Error(
+      `Missing required CDK config '${contextKey}'. Set it via 'cdk deploy -c ${contextKey}=...' or ${envVarName} in .env/.env.local.`,
+    );
+  }
+
+  return value;
+}
+
+function resolveOptionalConfigValue(stack: Stack, contextKey: string, envVarName: string): string | undefined {
+  const contextValue = normalizeConfigValue(stack.node.tryGetContext(contextKey));
+  if (contextValue) {
+    return contextValue;
+  }
+
+  const envValue = normalizeConfigValue(process.env[envVarName]);
+  if (envValue) {
+    return envValue;
+  }
+
+  return undefined;
+}
+
+function normalizeConfigValue(value: unknown): string | undefined {
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+      .filter(Boolean);
+    return parts.length > 0 ? parts.join(",") : undefined;
+  }
+
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (normalized === "agent_placeholder" || normalized === "env_placeholder") {
+    return undefined;
+  }
+
+  return normalized;
 }

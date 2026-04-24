@@ -1,4 +1,4 @@
-import { splitTextForSlack } from "../shared/text";
+import { normalizeTextForSlack, splitTextForSlack } from "../shared/text";
 
 export interface SlackPostMessageInput {
   channel: string;
@@ -20,7 +20,7 @@ export class SlackWebClient {
   constructor(private readonly tokenProvider: () => Promise<string>) {}
 
   async postMessage(input: SlackPostMessageInput): Promise<SlackPostMessageResult> {
-    const chunks = splitTextForSlack(input.text);
+    const chunks = splitTextForSlack(normalizeTextForSlack(input.text));
     let firstMessageTs: string | undefined;
 
     for (const chunk of chunks) {

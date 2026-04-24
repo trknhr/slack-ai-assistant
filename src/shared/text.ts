@@ -18,3 +18,29 @@ export function splitTextForSlack(text: string, maxLength = 3000): string[] {
 
   return chunks.filter(Boolean);
 }
+
+export function normalizeTextForSlack(text: string): string {
+  return transformOutsideCode(text, (segment) =>
+    segment
+      .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, "<$2|$1>")
+      .replace(/\*\*(.+?)\*\*/gs, "*$1*")
+      .replace(/__(.+?)__/gs, "_$1_")
+      .replace(/~~(.+?)~~/gs, "~$1~"),
+  ).trim();
+}
+
+function transformOutsideCode(text: string, transform: (segment: string) => string): string {
+  const pattern = /```[\s\S]*?```|`[^`\n]+`/g;
+  let cursor = 0;
+  let result = "";
+
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    result += transform(text.slice(cursor, index));
+    result += match[0];
+    cursor = index + match[0].length;
+  }
+
+  result += transform(text.slice(cursor));
+  return result;
+}
