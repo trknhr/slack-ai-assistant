@@ -22,6 +22,8 @@ const stringArrayFromCsv = z
 
 const baseEnvSchema = z.object({
   SESSION_TABLE_NAME: requiredString,
+  CONVERSATION_SESSIONS_TABLE_NAME: requiredString,
+  CONVERSATION_TURNS_TABLE_NAME: requiredString,
   USER_MEMORY_TABLE_NAME: requiredString,
   MEMORY_ITEMS_TABLE_NAME: requiredString,
   TASKS_TABLE_NAME: requiredString,
@@ -37,6 +39,7 @@ const baseEnvSchema = z.object({
   ANTHROPIC_MANAGED_AGENTS_BETA: requiredString.default("managed-agents-2026-04-01"),
   EVENT_DEDUP_TTL_SECONDS: z.coerce.number().int().positive().default(86400),
   AGENT_RESPONSE_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
+  TOP_LEVEL_CONTEXT_TURN_LIMIT: z.coerce.number().int().positive().default(10),
   MAX_SLACK_FILE_BYTES: z.coerce.number().int().positive().default(10_000_000),
   ENABLE_USER_MEMORY: booleanFromEnv,
   DEFAULT_SCHEDULE_CHANNEL: requiredString,

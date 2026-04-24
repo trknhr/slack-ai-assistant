@@ -5,11 +5,13 @@ export const slackQueueMessageSchema = z.object({
   eventId: z.string().min(1),
   workspaceId: z.string().min(1),
   channelId: z.string().min(1),
-  threadTs: z.string().min(1),
+  conversationTs: z.string().min(1),
+  replyThreadTs: z.string().min(1).optional(),
   messageTs: z.string().min(1),
   userId: z.string().min(1),
   text: z.string().min(1),
   source: z.enum(["app_mention", "dm", "thread_reply"]),
+  contextScope: z.enum(["channel_top_level", "thread"]),
   receivedAt: z.string().min(1),
   files: z
     .array(
@@ -33,6 +35,33 @@ export const slackQueueMessageSchema = z.object({
 export type SlackQueueMessage = z.infer<typeof slackQueueMessageSchema>;
 
 export type SlackFileReference = SlackQueueMessage["files"][number];
+
+export interface ConversationSessionRecord {
+  workspaceId: string;
+  channelId: string;
+  conversationTs: string;
+  claudeSessionId: string;
+  memoryStoreId?: string;
+  createdAt: string;
+  lastUsedAt: string;
+}
+
+export interface ConversationTurnRecord {
+  turnId: string;
+  workspaceId: string;
+  channelId: string;
+  conversationTs: string;
+  contextScope: "channel_top_level" | "thread";
+  role: "user" | "assistant" | "tool" | "system";
+  source: "slack";
+  sourceEvent: "app_mention" | "dm" | "thread_reply" | "assistant_reply" | "thread_backfill";
+  threadTs?: string;
+  messageTs: string;
+  turnTs: string;
+  userId?: string;
+  text: string;
+  createdAt: string;
+}
 
 export interface ThreadSessionRecord {
   workspaceId: string;

@@ -8,25 +8,36 @@ export interface SlackPostMessageInput {
 
 interface SlackApiResponse {
   ok: boolean;
+  ts?: string;
   error?: string;
+}
+
+export interface SlackPostMessageResult {
+  ts: string | undefined;
 }
 
 export class SlackWebClient {
   constructor(private readonly tokenProvider: () => Promise<string>) {}
 
-  async postMessage(input: SlackPostMessageInput): Promise<void> {
+  async postMessage(input: SlackPostMessageInput): Promise<SlackPostMessageResult> {
     const chunks = splitTextForSlack(input.text);
+    let firstMessageTs: string | undefined;
 
     for (const chunk of chunks) {
-      await this.call("chat.postMessage", {
+      const response = await this.call("chat.postMessage", {
         channel: input.channel,
         text: chunk,
         thread_ts: input.threadTs,
       });
+      firstMessageTs ??= response.ts;
     }
+
+    return {
+      ts: firstMessageTs,
+    };
   }
 
-  private async call(method: string, body: Record<string, unknown>): Promise<void> {
+  private async call(method: string, body: Record<string, unknown>): Promise<SlackApiResponse> {
     const token = await this.tokenProvider();
     const response = await fetch(`https://slack.com/api/${method}`, {
       method: "POST",
@@ -45,5 +56,7 @@ export class SlackWebClient {
     if (!payload.ok) {
       throw new Error(`Slack API ${method} returned error: ${payload.error}`);
     }
+
+    return payload;
   }
 }

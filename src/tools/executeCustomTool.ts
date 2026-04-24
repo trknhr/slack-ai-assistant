@@ -4,9 +4,11 @@ import { CalendarDraft, CalendarDraftCandidate, CalendarDraftStatus } from "../c
 import { GoogleCalendarClient } from "../calendar/googleCalendarClient";
 import { ClaudeInputBlock, ClaudeSessionEvent } from "../claude/client";
 import { CalendarDraftRepository } from "../repo/calendarDraftRepository";
+import { ChannelMemoryRepository } from "../repo/channelMemoryRepository";
 import { MemoryItemRepository } from "../repo/memoryItemRepository";
 import { TaskEventRepository } from "../repo/taskEventRepository";
 import { TaskStateRepository } from "../repo/taskStateRepository";
+import { UserPreferenceRepository } from "../repo/userPreferenceRepository";
 import { Logger } from "../shared/logger";
 import { TaskStatus } from "../tasks/taskState";
 
@@ -14,14 +16,17 @@ const searchMemoriesSchema = z.object({
   query: z.string().min(1),
   entity_key: z.string().min(1).optional(),
   limit: z.number().int().min(1).max(20).optional(),
+  scope: z.enum(["all", "channel", "user_preference", "workspace"]).optional(),
 });
 
 const saveMemorySchema = z.object({
   text: z.string().min(1),
+  scope: z.enum(["channel", "user_preference", "workspace"]).optional(),
   entity_key: z.string().min(1).optional(),
   attributes: z.record(z.string(), z.unknown()).optional(),
   tags: z.array(z.string().min(1)).optional(),
   importance: z.number().min(0).max(1).optional(),
+  preference_key: z.string().min(1).optional(),
 });
 
 const listTasksSchema = z.object({
@@ -190,11 +195,14 @@ const CALENDAR_TOOL_NAMES = new Set([
 export interface ToolExecutionContext {
   workspaceId: string;
   userId?: string;
+  channelId?: string;
   logger: Logger;
 }
 
 interface ToolRepositories {
   memoryItems: MemoryItemRepository;
+  channelMemories?: ChannelMemoryRepository;
+  userPreferences?: UserPreferenceRepository;
   tasks: TaskStateRepository;
   taskEvents: TaskEventRepository;
   calendarDrafts?: CalendarDraftRepository;
@@ -289,31 +297,156 @@ export class CustomToolExecutor {
 
   private async searchMemories(input: Record<string, unknown>): Promise<ToolExecutionResult> {
     const parsed = searchMemoriesSchema.parse(input);
-    const memories = await this.repositories.memoryItems.search({
-      workspaceId: this.context.workspaceId,
-      query: parsed.query,
-      entityKey: parsed.entity_key,
-      limit: parsed.limit,
-    });
+    const scope = parsed.scope ?? inferSearchScope(this.context);
+    const limit = parsed.limit;
+    const results: Array<Record<string, unknown>> = [];
+
+    if ((scope === "all" || scope === "channel") && this.context.channelId && this.repositories.channelMemories) {
+      const memories = await this.repositories.channelMemories.search({
+        workspaceId: this.context.workspaceId,
+        channelId: this.context.channelId,
+        query: parsed.query,
+        entityKey: parsed.entity_key,
+        limit,
+      });
+      results.push(
+        ...memories.map((memory) => ({
+          scope: "channel",
+          memory_id: memory.memoryId,
+          entity_key: memory.entityKey,
+          text: memory.text,
+          attributes: memory.attributes ?? {},
+          tags: memory.tags ?? [],
+          importance: memory.importance ?? 0,
+          updated_at: memory.updatedAt,
+          status: memory.status,
+        })),
+      );
+    }
+
+    if (
+      (scope === "all" || scope === "user_preference") &&
+      this.context.userId &&
+      this.repositories.userPreferences
+    ) {
+      const preferences = await this.repositories.userPreferences.search({
+        workspaceId: this.context.workspaceId,
+        userId: this.context.userId,
+        query: parsed.query,
+        entityKey: parsed.entity_key,
+        limit,
+      });
+      results.push(
+        ...preferences.map((preference) => ({
+          scope: "user_preference",
+          memory_id: preference.preferenceId,
+          preference_key: preference.preferenceKey,
+          entity_key: preference.entityKey,
+          text: preference.text,
+          attributes: preference.attributes ?? {},
+          tags: preference.tags ?? [],
+          importance: preference.importance ?? 0,
+          updated_at: preference.updatedAt,
+        })),
+      );
+    }
+
+    if (scope === "workspace" || (scope === "all" && results.length === 0)) {
+      const memories = await this.repositories.memoryItems.search({
+        workspaceId: this.context.workspaceId,
+        query: parsed.query,
+        entityKey: parsed.entity_key,
+        limit,
+      });
+      results.push(
+        ...memories.map((memory) => ({
+          scope: "workspace",
+          memory_id: memory.memoryId,
+          entity_key: memory.entityKey,
+          text: memory.text,
+          attributes: memory.attributes ?? {},
+          tags: memory.tags ?? [],
+          importance: memory.importance ?? 0,
+          updated_at: memory.updatedAt,
+        })),
+      );
+    }
 
     return jsonResult({
-      count: memories.length,
-      memories: memories.map((memory) => ({
-        memory_id: memory.memoryId,
-        entity_key: memory.entityKey,
-        text: memory.text,
-        attributes: memory.attributes ?? {},
-        tags: memory.tags ?? [],
-        importance: memory.importance ?? 0,
-        updated_at: memory.updatedAt,
-      })),
+      count: results.length,
+      memories: results.slice(0, limit ?? 20),
     });
   }
 
   private async saveMemory(input: Record<string, unknown>): Promise<ToolExecutionResult> {
     const parsed = saveMemorySchema.parse(input);
+    const scope = parsed.scope ?? inferSaveScope(this.context);
     const entityKey = normalizeEntityKey(parsed.entity_key);
     const tags = normalizeTags(parsed.tags);
+
+    if (scope === "channel") {
+      if (!this.context.channelId || !this.repositories.channelMemories) {
+        return errorResult("Channel-scoped memory is unavailable in this context.");
+      }
+
+      const memory = await this.repositories.channelMemories.save({
+        workspaceId: this.context.workspaceId,
+        channelId: this.context.channelId,
+        entityKey,
+        text: parsed.text,
+        attributes: parsed.attributes,
+        tags,
+        importance: parsed.importance,
+        status: "active",
+        origin: "explicit",
+        sourceType: "agent",
+        createdByUserId: this.context.userId,
+      });
+      this.savedMemoryIds.add(memory.memoryId);
+
+      return jsonResult({
+        saved: true,
+        scope: "channel",
+        memory_id: memory.memoryId,
+        entity_key: memory.entityKey,
+        text: memory.text,
+        tags: memory.tags ?? [],
+        updated_at: memory.updatedAt,
+      });
+    }
+
+    if (scope === "user_preference") {
+      if (!this.context.userId || !this.repositories.userPreferences) {
+        return errorResult("User preference memory is unavailable in this context.");
+      }
+
+      const preference = await this.repositories.userPreferences.save({
+        workspaceId: this.context.workspaceId,
+        userId: this.context.userId,
+        preferenceKey: normalizeOptionalString(parsed.preference_key),
+        entityKey,
+        text: parsed.text,
+        attributes: parsed.attributes,
+        tags,
+        importance: parsed.importance,
+        origin: "explicit",
+        sourceType: "agent",
+        createdByUserId: this.context.userId,
+      });
+      this.savedMemoryIds.add(preference.preferenceId);
+
+      return jsonResult({
+        saved: true,
+        scope: "user_preference",
+        memory_id: preference.preferenceId,
+        preference_key: preference.preferenceKey,
+        entity_key: preference.entityKey,
+        text: preference.text,
+        tags: preference.tags ?? [],
+        updated_at: preference.updatedAt,
+      });
+    }
+
     const memory = await this.repositories.memoryItems.save({
       workspaceId: this.context.workspaceId,
       entityKey,
@@ -328,6 +461,7 @@ export class CustomToolExecutor {
 
     return jsonResult({
       saved: true,
+      scope: "workspace",
       memory_id: memory.memoryId,
       entity_key: memory.entityKey,
       text: memory.text,
@@ -784,6 +918,25 @@ function normalizeTags(tags?: string[]): string[] | undefined {
 
   const normalized = [...new Set(tags.map((tag) => tag.trim().toLowerCase().replace(/\s+/g, "_")).filter(Boolean))];
   return normalized.length > 0 ? normalized : undefined;
+}
+
+function inferSearchScope(context: ToolExecutionContext): "all" | "workspace" {
+  if (context.channelId || context.userId) {
+    return "all";
+  }
+
+  return "workspace";
+}
+
+function inferSaveScope(context: ToolExecutionContext): "channel" | "user_preference" | "workspace" {
+  if (context.channelId) {
+    return "channel";
+  }
+  if (context.userId) {
+    return "user_preference";
+  }
+
+  return "workspace";
 }
 
 function normalizeCalendarDraftCandidate(

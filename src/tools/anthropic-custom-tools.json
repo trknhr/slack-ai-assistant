@@ -2,7 +2,7 @@
   {
     "type": "custom",
     "name": "search_memories",
-    "description": "Search saved memories and facts relevant to a person, topic, or past event. If the first search is weak, retry with alternate phrasings, synonyms, or entity-focused queries before concluding the memory is missing.",
+    "description": "Search saved memories relevant to a person, topic, or past event. Prefer current channel memory for shared channel context and user_preference for cross-channel personal preferences. If the first search is weak, retry with alternate phrasings, synonyms, or entity-focused queries before concluding the memory is missing.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -14,6 +14,11 @@
           "type": "string",
           "description": "Optional stable entity key such as person:hanako, project:renovation, or place:home to narrow the search."
         },
+        "scope": {
+          "type": "string",
+          "enum": ["all", "channel", "user_preference", "workspace"],
+          "description": "Optional search scope. Use channel for current-channel shared memory, user_preference for cross-channel personal preferences, all to combine them, or workspace for legacy workspace-wide memory."
+        },
         "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
       },
       "required": ["query"]
@@ -22,7 +27,7 @@
   {
     "type": "custom",
     "name": "save_memory",
-    "description": "Save a durable memory such as a preference, stable fact, personal detail, or reusable rule. Save one memory per fact and do not save transient chatter or daily summaries.",
+    "description": "Save a durable memory. Use scope=user_preference for personal preferences like preferred name, language, or style. Use scope=channel for stable channel-shared rules, decisions, and references. Save one memory per fact and do not save transient chatter or daily summaries.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -30,9 +35,18 @@
           "type": "string",
           "description": "One concise durable fact, preference, or rule. Do not combine unrelated facts."
         },
+        "scope": {
+          "type": "string",
+          "enum": ["channel", "user_preference", "workspace"],
+          "description": "Where this memory should live. Prefer channel for channel-shared durable context, user_preference for personal preferences, and workspace only for legacy import or non-channel contexts."
+        },
         "entity_key": {
           "type": "string",
           "description": "Stable key like person:hanako, project:renovation, place:home, or vendor:costco."
+        },
+        "preference_key": {
+          "type": "string",
+          "description": "Optional stable key for user_preference entries such as preferred_name, response_language, writing_style, or format_preference."
         },
         "attributes": {
           "type": "object",

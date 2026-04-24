@@ -74,7 +74,9 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
   log.info("Slack event enqueued", {
     eventId: queueMessage.eventId,
     channelId: queueMessage.channelId,
-    threadTs: queueMessage.threadTs,
+    conversationTs: queueMessage.conversationTs,
+    replyThreadTs: queueMessage.replyThreadTs,
+    contextScope: queueMessage.contextScope,
   });
 
   return response(200, { ok: true });

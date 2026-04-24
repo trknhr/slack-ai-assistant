@@ -1,5 +1,6 @@
 import type { SQSEvent } from "aws-lambda";
 import { SecretsProvider } from "../../aws/secretsProvider";
+import { buildSlackContextBlocks, buildTurnText } from "../../conversations/buildSlackContextBlocks";
 import { AnthropicManagedAgentsClient } from "../../claude/client";
 import { createSession } from "../../claude/createSession";
 import { sendUserMessage } from "../../claude/sendUserMessage";
@@ -8,15 +9,19 @@ import { loadWorkerEnv } from "../../config/env";
 import { MEMORY_RESOURCE_PROMPT } from "../../memory/instructions";
 import { GoogleCalendarClient } from "../../calendar/googleCalendarClient";
 import { CalendarDraftRepository } from "../../repo/calendarDraftRepository";
+import { ChannelMemoryRepository } from "../../repo/channelMemoryRepository";
 import { MemoryStoreService } from "../../memory/getOrCreateMemoryStore";
 import { MemoryItemRepository } from "../../repo/memoryItemRepository";
-import { SessionRepository } from "../../repo/sessionRepository";
+import { ConversationSessionRepository } from "../../repo/conversationSessionRepository";
+import { ConversationTurnRepository } from "../../repo/conversationTurnRepository";
 import { SourceDocumentRepository } from "../../repo/sourceDocumentRepository";
 import { TaskEventRepository } from "../../repo/taskEventRepository";
 import { TaskStateRepository } from "../../repo/taskStateRepository";
 import { UserMemoryRepository } from "../../repo/userMemoryRepository";
-import { slackQueueMessageSchema, ThreadSessionRecord } from "../../shared/contracts";
+import { UserPreferenceRepository } from "../../repo/userPreferenceRepository";
+import { ConversationSessionRecord, ConversationTurnRecord, slackQueueMessageSchema } from "../../shared/contracts";
 import { logger } from "../../shared/logger";
+import { SlackConversationsClient, SlackThreadMessage } from "../../slack/conversationsClient";
 import { SlackFilesClient } from "../../slack/filesClient";
 import { SlackAttachmentArchiveService } from "../../slack/slackAttachmentArchiveService";
 import { SlackWebClient } from "../../slack/postMessage";
@@ -31,6 +36,9 @@ const claudeClient = new AnthropicManagedAgentsClient({
 const slackClient = new SlackWebClient(() =>
   secretsProvider.getSecretString(env.SLACK_BOT_TOKEN_SECRET_ID),
 );
+const slackConversationsClient = new SlackConversationsClient(() =>
+  secretsProvider.getSecretString(env.SLACK_BOT_TOKEN_SECRET_ID),
+);
 const slackFilesClient = new SlackFilesClient(
   () => secretsProvider.getSecretString(env.SLACK_BOT_TOKEN_SECRET_ID),
   env.MAX_SLACK_FILE_BYTES,
@@ -41,11 +49,14 @@ const googleCalendarClient = new GoogleCalendarClient({
   defaultTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
 });
 const memoryItemRepository = new MemoryItemRepository(env.MEMORY_ITEMS_TABLE_NAME);
-const sessionRepository = new SessionRepository(env.SESSION_TABLE_NAME);
+const channelMemoryRepository = new ChannelMemoryRepository(env.MEMORY_ITEMS_TABLE_NAME);
+const conversationSessionRepository = new ConversationSessionRepository(env.CONVERSATION_SESSIONS_TABLE_NAME);
+const conversationTurnRepository = new ConversationTurnRepository(env.CONVERSATION_TURNS_TABLE_NAME);
 const sourceDocumentRepository = new SourceDocumentRepository(env.SOURCE_DOCUMENTS_TABLE_NAME);
 const taskEventRepository = new TaskEventRepository(env.TASK_EVENTS_TABLE_NAME);
 const taskStateRepository = new TaskStateRepository(env.TASKS_TABLE_NAME);
 const userMemoryRepository = new UserMemoryRepository(env.USER_MEMORY_TABLE_NAME);
+const userPreferenceRepository = new UserPreferenceRepository(env.MEMORY_ITEMS_TABLE_NAME);
 const memoryStoreService = new MemoryStoreService(userMemoryRepository, claudeClient);
 const attachmentArchiveService = new SlackAttachmentArchiveService(
   env.SLACK_ATTACHMENT_ARCHIVE_BUCKET_NAME,
@@ -62,22 +73,23 @@ export async function handler(event: SQSEvent): Promise<void> {
     });
 
     const now = new Date().toISOString();
-    const existingSession = await sessionRepository.findByThread(
+    const existingSession = await conversationSessionRepository.findByConversation(
       queueMessage.workspaceId,
       queueMessage.channelId,
-      queueMessage.threadTs,
+      queueMessage.conversationTs,
     );
+
     if (queueMessage.source === "thread_reply" && !existingSession) {
       log.info("Slack thread reply ignored because no assistant session exists", {
         channelId: queueMessage.channelId,
-        threadTs: queueMessage.threadTs,
+        conversationTs: queueMessage.conversationTs,
         messageTs: queueMessage.messageTs,
       });
       continue;
     }
 
     let memoryStoreId = existingSession?.memoryStoreId;
-    if (env.ENABLE_USER_MEMORY) {
+    if (env.ENABLE_USER_MEMORY && !memoryStoreId) {
       const memoryStore = await memoryStoreService.getOrCreateMemoryStore({
         workspaceId: queueMessage.workspaceId,
         userId: queueMessage.userId,
@@ -87,10 +99,10 @@ export async function handler(event: SQSEvent): Promise<void> {
 
     const sessionRecord =
       existingSession ??
-      createThreadSession(
+      createConversationSession(
         queueMessage.workspaceId,
         queueMessage.channelId,
-        queueMessage.threadTs,
+        queueMessage.conversationTs,
         memoryStoreId,
       );
 
@@ -99,11 +111,12 @@ export async function handler(event: SQSEvent): Promise<void> {
         agentId: env.ANTHROPIC_AGENT_ID,
         environmentId: env.ANTHROPIC_ENVIRONMENT_ID,
         vaultIds: env.ANTHROPIC_VAULT_IDS,
-        title: `Slack thread ${queueMessage.channelId}/${queueMessage.threadTs}`,
+        title: `Slack conversation ${queueMessage.channelId}/${queueMessage.conversationTs}`,
         metadata: {
           workspace_id: queueMessage.workspaceId,
           channel_id: queueMessage.channelId,
-          thread_ts: queueMessage.threadTs,
+          conversation_ts: queueMessage.conversationTs,
+          ...(queueMessage.replyThreadTs ? { reply_thread_ts: queueMessage.replyThreadTs } : {}),
           source: "slack",
         },
         memoryResources: memoryStoreId
@@ -116,13 +129,17 @@ export async function handler(event: SQSEvent): Promise<void> {
             ]
           : [],
       });
-      sessionRecord.sessionId = session.id;
+      sessionRecord.claudeSessionId = session.id;
       sessionRecord.lastUsedAt = now;
-      await sessionRepository.save(sessionRecord);
+      await conversationSessionRepository.save(sessionRecord);
+
+      if (queueMessage.contextScope === "thread") {
+        await backfillThreadHistory(queueMessage, log);
+      }
     }
 
     const seenEventIds = new Set(
-      (await claudeClient.listSessionEvents(sessionRecord.sessionId, { order: "asc" })).map(
+      (await claudeClient.listSessionEvents(sessionRecord.claudeSessionId, { order: "asc" })).map(
         (sessionEvent) => sessionEvent.id,
       ),
     );
@@ -131,16 +148,47 @@ export async function handler(event: SQSEvent): Promise<void> {
     await attachmentArchiveService.archiveAttachments({
       workspaceId: queueMessage.workspaceId,
       channelId: queueMessage.channelId,
-      threadTs: queueMessage.threadTs,
+      threadTs: queueMessage.replyThreadTs ?? queueMessage.conversationTs,
       messageTs: queueMessage.messageTs,
       userId: queueMessage.userId,
       attachments: preparedAttachments,
       logger: log,
     });
     const attachmentBlocks = slackFilesClient.buildContentBlocks(preparedAttachments);
+
+    const priorTurns =
+      queueMessage.contextScope === "thread"
+        ? await conversationTurnRepository.listByConversation(
+            queueMessage.workspaceId,
+            queueMessage.channelId,
+            queueMessage.conversationTs,
+          )
+        : await conversationTurnRepository.listRecentChannelTopLevelTurns(
+            queueMessage.workspaceId,
+            queueMessage.channelId,
+            env.TOP_LEVEL_CONTEXT_TURN_LIMIT,
+          );
+
+    await conversationTurnRepository.save({
+      workspaceId: queueMessage.workspaceId,
+      channelId: queueMessage.channelId,
+      conversationTs: queueMessage.conversationTs,
+      contextScope: queueMessage.contextScope,
+      role: "user",
+      source: "slack",
+      sourceEvent: queueMessage.source,
+      threadTs: queueMessage.replyThreadTs,
+      messageTs: queueMessage.messageTs,
+      turnTs: queueMessage.messageTs,
+      userId: queueMessage.userId,
+      text: buildTurnText(queueMessage.text, queueMessage.files),
+    });
+
     const customToolExecutor = new CustomToolExecutor(
       {
         memoryItems: memoryItemRepository,
+        channelMemories: channelMemoryRepository,
+        userPreferences: userPreferenceRepository,
         tasks: taskStateRepository,
         taskEvents: taskEventRepository,
         calendarDrafts: calendarDraftRepository,
@@ -148,6 +196,7 @@ export async function handler(event: SQSEvent): Promise<void> {
       {
         workspaceId: queueMessage.workspaceId,
         userId: queueMessage.userId,
+        channelId: queueMessage.channelId,
         logger: log,
       },
       {
@@ -157,37 +206,53 @@ export async function handler(event: SQSEvent): Promise<void> {
     );
 
     await sendUserMessage(claudeClient, {
-      sessionId: sessionRecord.sessionId,
-      content: [
-        {
-          type: "text",
-          text: queueMessage.text,
-        },
-        ...attachmentBlocks,
-      ],
+      sessionId: sessionRecord.claudeSessionId,
+      content: buildSlackContextBlocks({
+        contextScope: queueMessage.contextScope,
+        priorTurns,
+        currentText: queueMessage.text,
+        attachmentBlocks,
+      }),
     });
 
     const completion = await waitForCompletion(claudeClient, {
-      sessionId: sessionRecord.sessionId,
+      sessionId: sessionRecord.claudeSessionId,
       sinceEventIds: seenEventIds,
       timeoutMs: env.AGENT_RESPONSE_TIMEOUT_MS,
       onCustomToolUse: (event) => customToolExecutor.execute(event),
     });
 
-    await slackClient.postMessage({
+    const postedMessage = await slackClient.postMessage({
       channel: queueMessage.channelId,
-      threadTs: queueMessage.threadTs,
+      threadTs: queueMessage.replyThreadTs,
       text: completion.text,
     });
 
-    await sessionRepository.save({
+    const assistantMessageTs = postedMessage.ts ?? createSyntheticSlackTs();
+    await conversationTurnRepository.save({
+      workspaceId: queueMessage.workspaceId,
+      channelId: queueMessage.channelId,
+      conversationTs: queueMessage.conversationTs,
+      contextScope: queueMessage.contextScope,
+      role: "assistant",
+      source: "slack",
+      sourceEvent: "assistant_reply",
+      threadTs: queueMessage.replyThreadTs,
+      messageTs: assistantMessageTs,
+      turnTs: assistantMessageTs,
+      text: completion.text,
+    });
+
+    await conversationSessionRepository.save({
       ...sessionRecord,
       memoryStoreId,
       lastUsedAt: now,
     });
 
-    log.info("Slack thread processed", {
-      sessionId: sessionRecord.sessionId,
+    log.info("Slack conversation processed", {
+      claudeSessionId: sessionRecord.claudeSessionId,
+      conversationTs: queueMessage.conversationTs,
+      contextScope: queueMessage.contextScope,
       status: completion.status,
       attachmentCount: queueMessage.files.length,
       archivedAttachmentCount: preparedAttachments.filter((attachment) => attachment.status === "ready").length,
@@ -195,20 +260,79 @@ export async function handler(event: SQSEvent): Promise<void> {
   }
 }
 
-function createThreadSession(
+function createConversationSession(
   workspaceId: string,
   channelId: string,
-  threadTs: string,
+  conversationTs: string,
   memoryStoreId?: string,
-): ThreadSessionRecord {
+): ConversationSessionRecord {
   const now = new Date().toISOString();
   return {
     workspaceId,
     channelId,
-    threadTs,
-    sessionId: "",
+    conversationTs,
+    claudeSessionId: "",
     memoryStoreId,
     createdAt: now,
     lastUsedAt: now,
   };
+}
+
+async function backfillThreadHistory(
+  queueMessage: {
+    workspaceId: string;
+    channelId: string;
+    conversationTs: string;
+    messageTs: string;
+  },
+  log: ReturnType<typeof logger.child>,
+): Promise<void> {
+  const threadMessages = await slackConversationsClient.listReplies(
+    queueMessage.channelId,
+    queueMessage.conversationTs,
+  );
+  const priorMessages = threadMessages.filter((message) => compareSlackTs(message.ts, queueMessage.messageTs) < 0);
+
+  for (const message of priorMessages) {
+    const text = buildTurnText(message.text, message.files);
+    if (!text.trim()) {
+      continue;
+    }
+
+    await conversationTurnRepository.save({
+      workspaceId: queueMessage.workspaceId,
+      channelId: queueMessage.channelId,
+      conversationTs: queueMessage.conversationTs,
+      contextScope: "thread",
+      role: inferBackfillRole(message),
+      source: "slack",
+      sourceEvent: "thread_backfill",
+      threadTs: queueMessage.conversationTs,
+      messageTs: message.ts,
+      turnTs: message.ts,
+      userId: message.userId,
+      text,
+    });
+  }
+
+  log.info("Slack thread history backfilled", {
+    channelId: queueMessage.channelId,
+    conversationTs: queueMessage.conversationTs,
+    backfilledTurnCount: priorMessages.length,
+  });
+}
+
+function inferBackfillRole(message: SlackThreadMessage): ConversationTurnRecord["role"] {
+  return message.botId || message.subtype ? "system" : "user";
+}
+
+function compareSlackTs(left: string, right: string): number {
+  return parseFloat(left) - parseFloat(right);
+}
+
+function createSyntheticSlackTs(): string {
+  const milliseconds = Date.now();
+  const seconds = Math.floor(milliseconds / 1000);
+  const micros = `${milliseconds % 1000}`.padStart(3, "0");
+  return `${seconds}.${micros}000`;
 }

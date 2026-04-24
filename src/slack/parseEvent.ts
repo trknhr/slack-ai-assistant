@@ -78,10 +78,14 @@ function buildQueueMessage(
   const channelId = typeof event.channel === "string" ? event.channel : "";
   const userId = typeof event.user === "string" ? event.user : "";
   const eventTs = typeof event.event_ts === "string" ? event.event_ts : "";
-  const threadTs =
-    typeof event.thread_ts === "string" && event.thread_ts.length > 0 ? event.thread_ts : eventTs;
+  const explicitThreadTs =
+    typeof event.thread_ts === "string" && event.thread_ts.length > 0 ? event.thread_ts : undefined;
   const normalizedText = source === "app_mention" ? stripBotMention(text) : text.trim();
   const files = extractFiles(event.files);
+  const contextScope = explicitThreadTs ? "thread" : "channel_top_level";
+  const conversationTs = explicitThreadTs ?? eventTs;
+  const replyThreadTs =
+    explicitThreadTs ?? (source === "app_mention" && eventTs ? eventTs : undefined);
 
   if (!normalizedText && files.length === 0) {
     return null;
@@ -96,11 +100,13 @@ function buildQueueMessage(
     eventId,
     workspaceId,
     channelId,
-    threadTs,
+    conversationTs,
+    replyThreadTs,
     messageTs: eventTs,
     userId,
     text: normalizedText || "Please analyze the attached file(s).",
     source,
+    contextScope,
     receivedAt: new Date().toISOString(),
     files,
   };

@@ -45,6 +45,27 @@ export class SlackAiAssistantStack extends Stack {
       pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
     });
 
+    const conversationSessionsTable = new dynamodb.Table(this, "ConversationSessionsTable", {
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+    });
+
+    const conversationTurnsTable = new dynamodb.Table(this, "ConversationTurnsTable", {
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+    });
+
+    conversationTurnsTable.addGlobalSecondaryIndex({
+      indexName: "ChannelScopeIndex",
+      partitionKey: { name: "gsi1pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "gsi1sk", type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
     const userMemoryTable = new dynamodb.Table(this, "UserMemoriesTable", {
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -145,6 +166,8 @@ export class SlackAiAssistantStack extends Stack {
 
     const commonEnvironment = {
       SESSION_TABLE_NAME: sessionTable.tableName,
+      CONVERSATION_SESSIONS_TABLE_NAME: conversationSessionsTable.tableName,
+      CONVERSATION_TURNS_TABLE_NAME: conversationTurnsTable.tableName,
       USER_MEMORY_TABLE_NAME: userMemoryTable.tableName,
       MEMORY_ITEMS_TABLE_NAME: memoryItemsTable.tableName,
       TASKS_TABLE_NAME: tasksTable.tableName,
@@ -162,6 +185,7 @@ export class SlackAiAssistantStack extends Stack {
       DEFAULT_SCHEDULE_CHANNEL: defaultScheduleChannel,
       EVENT_DEDUP_TTL_SECONDS: "86400",
       AGENT_RESPONSE_TIMEOUT_MS: "120000",
+      TOP_LEVEL_CONTEXT_TURN_LIMIT: "10",
       MAX_SLACK_FILE_BYTES: "10000000",
     };
 
@@ -283,6 +307,8 @@ export class SlackAiAssistantStack extends Stack {
     documentImportQueue.grantSendMessages(documentImportApi);
     sessionTable.grantReadWriteData(worker);
     sessionTable.grantReadWriteData(scheduledRunner);
+    conversationSessionsTable.grantReadWriteData(worker);
+    conversationTurnsTable.grantReadWriteData(worker);
     userMemoryTable.grantReadWriteData(worker);
     userMemoryTable.grantReadWriteData(scheduledRunner);
     memoryItemsTable.grantReadWriteData(worker);
@@ -443,6 +469,12 @@ export class SlackAiAssistantStack extends Stack {
     });
     new cdk.CfnOutput(this, "MemoryItemsTableName", {
       value: memoryItemsTable.tableName,
+    });
+    new cdk.CfnOutput(this, "ConversationSessionsTableName", {
+      value: conversationSessionsTable.tableName,
+    });
+    new cdk.CfnOutput(this, "ConversationTurnsTableName", {
+      value: conversationTurnsTable.tableName,
     });
     new cdk.CfnOutput(this, "SourceDocumentsTableName", {
       value: sourceDocumentsTable.tableName,

@@ -10,10 +10,12 @@ import { loadChatApiEnv } from "../../config/env";
 import { MEMORY_RESOURCE_PROMPT } from "../../memory/instructions";
 import { MemoryStoreService } from "../../memory/getOrCreateMemoryStore";
 import { CalendarDraftRepository } from "../../repo/calendarDraftRepository";
+import { ChannelMemoryRepository } from "../../repo/channelMemoryRepository";
 import { MemoryItemRepository } from "../../repo/memoryItemRepository";
 import { TaskEventRepository } from "../../repo/taskEventRepository";
 import { TaskStateRepository } from "../../repo/taskStateRepository";
 import { UserMemoryRepository } from "../../repo/userMemoryRepository";
+import { UserPreferenceRepository } from "../../repo/userPreferenceRepository";
 import { logger } from "../../shared/logger";
 import { CustomToolExecutor } from "../../tools/executeCustomTool";
 
@@ -29,9 +31,11 @@ const googleCalendarClient = new GoogleCalendarClient({
   defaultTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
 });
 const memoryItemRepository = new MemoryItemRepository(env.MEMORY_ITEMS_TABLE_NAME);
+const channelMemoryRepository = new ChannelMemoryRepository(env.MEMORY_ITEMS_TABLE_NAME);
 const taskEventRepository = new TaskEventRepository(env.TASK_EVENTS_TABLE_NAME);
 const taskStateRepository = new TaskStateRepository(env.TASKS_TABLE_NAME);
 const userMemoryRepository = new UserMemoryRepository(env.USER_MEMORY_TABLE_NAME);
+const userPreferenceRepository = new UserPreferenceRepository(env.MEMORY_ITEMS_TABLE_NAME);
 const memoryStoreService = new MemoryStoreService(userMemoryRepository, claudeClient);
 
 export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
@@ -104,6 +108,8 @@ async function postMessage(
   const customToolExecutor = new CustomToolExecutor(
     {
       memoryItems: memoryItemRepository,
+      channelMemories: channelMemoryRepository,
+      userPreferences: userPreferenceRepository,
       tasks: taskStateRepository,
       taskEvents: taskEventRepository,
       calendarDrafts: calendarDraftRepository,
