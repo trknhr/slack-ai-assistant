@@ -46,6 +46,10 @@ export class SlackAiAssistantStack extends Stack {
     const defaultScheduleChannel =
       resolveOptionalConfigValue(this, "defaultScheduleChannel", "DEFAULT_SCHEDULE_CHANNEL") ??
       "C_PLACEHOLDER";
+    const publicBaseUrl = resolveOptionalConfigValue(this, "publicBaseUrl", "PUBLIC_BASE_URL");
+    const googleOAuthStartUrl = publicBaseUrl
+      ? `${trimTrailingSlash(publicBaseUrl)}/oauth/google/start`
+      : undefined;
 
     const sessionTable = new dynamodb.Table(this, "SlackThreadSessionsTable", {
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
@@ -143,6 +147,13 @@ export class SlackAiAssistantStack extends Stack {
       pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
     });
 
+    const googleOAuthConnectionsTable = new dynamodb.Table(this, "GoogleOAuthConnectionsTable", {
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+    });
+
     const attachmentArchiveBucket = new s3.Bucket(this, "SlackAttachmentArchiveBucket", {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
@@ -201,6 +212,7 @@ export class SlackAiAssistantStack extends Stack {
     const toolEnvironment = {
       CALENDAR_DRAFTS_TABLE_NAME: calendarDraftsTable.tableName,
       GOOGLE_CALENDAR_SECRET_ID: googleCalendarSecretName,
+      GOOGLE_OAUTH_CONNECTIONS_TABLE_NAME: googleOAuthConnectionsTable.tableName,
       GOOGLE_CALENDAR_TIME_ZONE: googleCalendarTimeZone,
     };
 
@@ -315,6 +327,23 @@ export class SlackAiAssistantStack extends Stack {
       },
     });
 
+    const googleOAuth = new nodejs.NodejsFunction(this, "GoogleOAuthFunction", {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      entry: join(__dirname, "../src/functions/google-oauth/index.ts"),
+      handler: "handler",
+      timeout: Duration.seconds(30),
+      memorySize: 256,
+      environment: {
+        ...commonEnvironment,
+        GOOGLE_CALENDAR_SECRET_ID: googleCalendarSecretName,
+        GOOGLE_OAUTH_CONNECTIONS_TABLE_NAME: googleOAuthConnectionsTable.tableName,
+        GOOGLE_CALENDAR_TIME_ZONE: googleCalendarTimeZone,
+      },
+      bundling: {
+        target: "node20",
+      },
+    });
+
     worker.addEventSource(
       new eventsources.SqsEventSource(slackEventsQueue, {
         batchSize: 1,
@@ -339,6 +368,12 @@ export class SlackAiAssistantStack extends Stack {
     memoryItemsTable.grantReadWriteData(scheduledRunner);
     memoryItemsTable.grantReadWriteData(documentImportWorker);
     memoryItemsTable.grantReadWriteData(chatApi);
+    googleOAuthConnectionsTable.grantReadWriteData(worker);
+    googleOAuthConnectionsTable.grantReadWriteData(scheduledRunner);
+    googleOAuthConnectionsTable.grantReadWriteData(documentImportWorker);
+    googleOAuthConnectionsTable.grantReadWriteData(chatApi);
+    googleOAuthConnectionsTable.grantReadWriteData(slackInteractions);
+    googleOAuthConnectionsTable.grantReadWriteData(googleOAuth);
     sourceDocumentsTable.grantReadWriteData(worker);
     sourceDocumentsTable.grantReadWriteData(documentImportApi);
     sourceDocumentsTable.grantReadWriteData(documentImportWorker);
@@ -393,6 +428,7 @@ export class SlackAiAssistantStack extends Stack {
 
     slackSigningSecret.grantRead(ingress);
     slackSigningSecret.grantRead(slackInteractions);
+    slackSigningSecret.grantRead(googleOAuth);
     slackBotTokenSecret.grantRead(worker);
     slackBotTokenSecret.grantRead(scheduledRunner);
     slackBotTokenSecret.grantRead(slackInteractions);
@@ -405,6 +441,7 @@ export class SlackAiAssistantStack extends Stack {
     googleCalendarSecret.grantRead(documentImportWorker);
     googleCalendarSecret.grantRead(chatApi);
     googleCalendarSecret.grantRead(slackInteractions);
+    googleCalendarSecret.grantRead(googleOAuth);
 
     const api = new apigateway.RestApi(this, "SlackEventsApi", {
       restApiName: "slack-ai-assistant-events",
@@ -419,6 +456,17 @@ export class SlackAiAssistantStack extends Stack {
       .getResource("slack")!
       .addResource("interactions")
       .addMethod("POST", new apigateway.LambdaIntegration(slackInteractions));
+    const oauthResource = api.root.addResource("oauth").addResource("google");
+    oauthResource.addResource("start").addMethod("GET", new apigateway.LambdaIntegration(googleOAuth));
+    oauthResource.addResource("callback").addMethod("GET", new apigateway.LambdaIntegration(googleOAuth));
+
+    if (googleOAuthStartUrl) {
+      worker.addEnvironment("GOOGLE_OAUTH_START_URL", googleOAuthStartUrl);
+      scheduledRunner.addEnvironment("GOOGLE_OAUTH_START_URL", googleOAuthStartUrl);
+      documentImportWorker.addEnvironment("GOOGLE_OAUTH_START_URL", googleOAuthStartUrl);
+      chatApi.addEnvironment("GOOGLE_OAUTH_START_URL", googleOAuthStartUrl);
+      slackInteractions.addEnvironment("GOOGLE_OAUTH_START_URL", googleOAuthStartUrl);
+    }
     const importsResource = api.root.addResource("imports");
     importsResource.addResource("uploads").addMethod("POST", new apigateway.LambdaIntegration(documentImportApi), {
       authorizationType: apigateway.AuthorizationType.IAM,
@@ -505,6 +553,15 @@ export class SlackAiAssistantStack extends Stack {
     new cdk.CfnOutput(this, "SlackInteractionsFunctionName", {
       value: slackInteractions.functionName,
     });
+    new cdk.CfnOutput(this, "GoogleOAuthStartUrl", {
+      value: `${api.url}oauth/google/start`,
+    });
+    new cdk.CfnOutput(this, "GoogleOAuthCallbackUrl", {
+      value: `${api.url}oauth/google/callback`,
+    });
+    new cdk.CfnOutput(this, "GoogleOAuthFunctionName", {
+      value: googleOAuth.functionName,
+    });
     new cdk.CfnOutput(this, "ScheduledTasksTableName", {
       value: scheduledTasksTable.tableName,
     });
@@ -528,6 +585,9 @@ export class SlackAiAssistantStack extends Stack {
     });
     new cdk.CfnOutput(this, "CalendarDraftsTableName", {
       value: calendarDraftsTable.tableName,
+    });
+    new cdk.CfnOutput(this, "GoogleOAuthConnectionsTableName", {
+      value: googleOAuthConnectionsTable.tableName,
     });
     new cdk.CfnOutput(this, "SlackAttachmentArchiveBucketName", {
       value: attachmentArchiveBucket.bucketName,
@@ -582,4 +642,8 @@ function normalizeConfigValue(value: unknown): string | undefined {
   }
 
   return normalized;
+}
+
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
 }

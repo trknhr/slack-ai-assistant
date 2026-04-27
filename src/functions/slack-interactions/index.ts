@@ -1,8 +1,9 @@
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
 import { SecretsProvider } from "../../aws/secretsProvider";
-import { GoogleCalendarClient } from "../../calendar/googleCalendarClient";
+import { createUserGoogleCalendarClient } from "../../calendar/userGoogleCalendar";
 import { loadSlackInteractionsEnv } from "../../config/env";
 import { CalendarDraftRepository } from "../../repo/calendarDraftRepository";
+import { GoogleOAuthConnectionRepository } from "../../repo/googleOAuthConnectionRepository";
 import { MemoryItemRepository } from "../../repo/memoryItemRepository";
 import { TaskEventRepository } from "../../repo/taskEventRepository";
 import { TaskStateRepository } from "../../repo/taskStateRepository";
@@ -34,10 +35,7 @@ const slackClient = new SlackWebClient(() =>
   secretsProvider.getSecretString(env.SLACK_BOT_TOKEN_SECRET_ID),
 );
 const calendarDraftRepository = new CalendarDraftRepository(env.CALENDAR_DRAFTS_TABLE_NAME);
-const googleCalendarClient = new GoogleCalendarClient({
-  secretProvider: () => secretsProvider.getSecretString(env.GOOGLE_CALENDAR_SECRET_ID),
-  defaultTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
-});
+const googleOAuthConnectionRepository = new GoogleOAuthConnectionRepository(env.GOOGLE_OAUTH_CONNECTIONS_TABLE_NAME);
 const memoryItemRepository = new MemoryItemRepository(env.MEMORY_ITEMS_TABLE_NAME);
 const taskEventRepository = new TaskEventRepository(env.TASK_EVENTS_TABLE_NAME);
 const taskStateRepository = new TaskStateRepository(env.TASKS_TABLE_NAME);
@@ -105,7 +103,16 @@ async function executeCalendarDraftAction(
       logger: log,
     },
     {
-      googleCalendar: googleCalendarClient,
+      googleCalendarProvider: () =>
+        createUserGoogleCalendarClient({
+          workspaceId: value.workspaceId,
+          userId: value.userId,
+          defaultTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
+          googleCalendarSecretId: env.GOOGLE_CALENDAR_SECRET_ID,
+          googleOAuthStartUrl: env.GOOGLE_OAUTH_START_URL,
+          secretsProvider,
+          connections: googleOAuthConnectionRepository,
+        }),
       defaultCalendarTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
     },
   );

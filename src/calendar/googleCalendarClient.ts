@@ -26,7 +26,7 @@ interface GoogleOAuthToken {
   expires_in?: number;
 }
 
-interface GoogleCalendarSecret {
+export interface GoogleCalendarCredentials {
   clientId: string;
   clientSecret: string;
   refreshToken: string;
@@ -68,23 +68,17 @@ const googleCalendarSecretSchema = z
         path: ["client_secret"],
       });
     }
-    if (!(value.refresh_token ?? value.refreshToken)) {
-      ctx.addIssue({
-        code: "custom",
-        message: "Google Calendar secret is missing refresh_token",
-        path: ["refresh_token"],
-      });
-    }
   });
 
 export class GoogleCalendarClient {
-  private credentialsPromise?: Promise<GoogleCalendarSecret>;
+  private credentialsPromise?: Promise<GoogleCalendarCredentials>;
   private accessTokenPromise?: Promise<{ accessToken: string; expiresAt: number }>;
   private cachedAccessToken?: { accessToken: string; expiresAt: number };
 
   constructor(
     private readonly options: {
-      secretProvider: () => Promise<string>;
+      secretProvider?: () => Promise<string>;
+      credentialsProvider?: () => Promise<GoogleCalendarCredentials>;
       defaultTimeZone: string;
     },
   ) {}
@@ -232,21 +226,32 @@ export class GoogleCalendarClient {
     };
   }
 
-  private async getCredentials(): Promise<GoogleCalendarSecret> {
+  private async getCredentials(): Promise<GoogleCalendarCredentials> {
     if (!this.credentialsPromise) {
       this.credentialsPromise = this.loadCredentials();
     }
     return this.credentialsPromise;
   }
 
-  private async loadCredentials(): Promise<GoogleCalendarSecret> {
+  private async loadCredentials(): Promise<GoogleCalendarCredentials> {
+    if (this.options.credentialsProvider) {
+      return this.options.credentialsProvider();
+    }
+    if (!this.options.secretProvider) {
+      throw new Error("Google Calendar credentials are not configured");
+    }
+
     const raw = await this.options.secretProvider();
     const parsed = googleCalendarSecretSchema.parse(JSON.parse(raw));
+    const refreshToken = parsed.refresh_token ?? parsed.refreshToken;
+    if (!refreshToken) {
+      throw new Error("Google Calendar secret is missing refresh_token");
+    }
 
     return {
       clientId: parsed.client_id ?? parsed.clientId!,
       clientSecret: parsed.client_secret ?? parsed.clientSecret!,
-      refreshToken: parsed.refresh_token ?? parsed.refreshToken!,
+      refreshToken,
       calendarId: parsed.calendar_id ?? parsed.calendarId ?? "primary",
       timeZone: parsed.time_zone ?? parsed.timeZone ?? this.options.defaultTimeZone,
     };

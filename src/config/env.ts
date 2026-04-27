@@ -52,6 +52,14 @@ const ingressEnvSchema = baseEnvSchema.extend({
 const toolRuntimeEnvSchema = baseEnvSchema.extend({
   CALENDAR_DRAFTS_TABLE_NAME: requiredString,
   GOOGLE_CALENDAR_SECRET_ID: requiredString,
+  GOOGLE_OAUTH_CONNECTIONS_TABLE_NAME: requiredString,
+  GOOGLE_OAUTH_START_URL: z.string().min(1).optional(),
+  GOOGLE_CALENDAR_TIME_ZONE: requiredString.default("Asia/Tokyo"),
+});
+
+const googleOAuthEnvSchema = baseEnvSchema.extend({
+  GOOGLE_CALENDAR_SECRET_ID: requiredString,
+  GOOGLE_OAUTH_CONNECTIONS_TABLE_NAME: requiredString,
   GOOGLE_CALENDAR_TIME_ZONE: requiredString.default("Asia/Tokyo"),
 });
 
@@ -84,6 +92,7 @@ export type ImportWorkerEnv = z.infer<typeof importWorkerEnvSchema>;
 export type ChatApiEnv = z.infer<typeof chatApiEnvSchema>;
 export type SchedulerEnv = z.infer<typeof schedulerEnvSchema>;
 export type SlackInteractionsEnv = z.infer<typeof slackInteractionsEnvSchema>;
+export type GoogleOAuthEnv = z.infer<typeof googleOAuthEnvSchema>;
 
 export function loadIngressEnv(): IngressEnv {
   return ingressEnvSchema.parse(process.env);
@@ -111,4 +120,8 @@ export function loadSchedulerEnv(): SchedulerEnv {
 
 export function loadSlackInteractionsEnv(): SlackInteractionsEnv {
   return slackInteractionsEnvSchema.parse(process.env);
+}
+
+export function loadGoogleOAuthEnv(): GoogleOAuthEnv {
+  return googleOAuthEnvSchema.parse(process.env);
 }

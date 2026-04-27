@@ -216,6 +216,7 @@ interface ToolRepositories {
 
 interface ToolIntegrations {
   googleCalendar?: GoogleCalendarClient;
+  googleCalendarProvider?: () => GoogleCalendarClient | Promise<GoogleCalendarClient>;
   defaultCalendarTimeZone?: string;
 }
 
@@ -592,7 +593,7 @@ export class CustomToolExecutor {
 
   private async listCalendarEvents(input: Record<string, unknown>): Promise<ToolExecutionResult> {
     const parsed = listCalendarEventsSchema.parse(input);
-    const calendar = this.requireGoogleCalendar();
+    const calendar = await this.requireGoogleCalendar();
     const timeMin = parsed.time_min ?? new Date().toISOString();
     const timeMax = parsed.time_max ?? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
@@ -626,7 +627,7 @@ export class CustomToolExecutor {
 
   private async findFreeBusy(input: Record<string, unknown>): Promise<ToolExecutionResult> {
     const parsed = findFreeBusySchema.parse(input);
-    const calendar = this.requireGoogleCalendar();
+    const calendar = await this.requireGoogleCalendar();
     const result = await calendar.queryFreeBusy({
       calendarIds: parsed.calendar_ids,
       timeMin: parsed.time_min,
@@ -715,7 +716,7 @@ export class CustomToolExecutor {
   private async applyCalendarDraft(input: Record<string, unknown>): Promise<ToolExecutionResult> {
     const parsed = applyCalendarDraftSchema.parse(input);
     const draftRepository = this.requireCalendarDraftRepository();
-    const calendar = this.requireGoogleCalendar();
+    const calendar = await this.requireGoogleCalendar();
     const draft = await draftRepository.get(this.context.workspaceId, this.context.userId, parsed.draft_id);
     if (!draft) {
       throw new Error(`Calendar draft ${parsed.draft_id} was not found`);
@@ -884,7 +885,10 @@ export class CustomToolExecutor {
     });
   }
 
-  private requireGoogleCalendar(): GoogleCalendarClient {
+  private async requireGoogleCalendar(): Promise<GoogleCalendarClient> {
+    if (this.integrations.googleCalendarProvider) {
+      return this.integrations.googleCalendarProvider();
+    }
     if (!this.integrations.googleCalendar) {
       throw new Error("Google Calendar integration is not configured");
     }

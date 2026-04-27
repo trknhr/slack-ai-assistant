@@ -8,13 +8,14 @@ import { sendUserMessage } from "../../claude/sendUserMessage";
 import { waitForCompletion } from "../../claude/waitForCompletion";
 import { loadWorkerEnv } from "../../config/env";
 import { MEMORY_RESOURCE_PROMPT } from "../../memory/instructions";
-import { GoogleCalendarClient } from "../../calendar/googleCalendarClient";
+import { createUserGoogleCalendarClient } from "../../calendar/userGoogleCalendar";
 import { CalendarDraftRepository } from "../../repo/calendarDraftRepository";
 import { ChannelMemoryRepository } from "../../repo/channelMemoryRepository";
 import { MemoryStoreService } from "../../memory/getOrCreateMemoryStore";
 import { MemoryItemRepository } from "../../repo/memoryItemRepository";
 import { ConversationSessionRepository } from "../../repo/conversationSessionRepository";
 import { ConversationTurnRepository } from "../../repo/conversationTurnRepository";
+import { GoogleOAuthConnectionRepository } from "../../repo/googleOAuthConnectionRepository";
 import { SourceDocumentRepository } from "../../repo/sourceDocumentRepository";
 import { TaskEventRepository } from "../../repo/taskEventRepository";
 import { TaskStateRepository } from "../../repo/taskStateRepository";
@@ -45,10 +46,6 @@ const slackFilesClient = new SlackFilesClient(
   env.MAX_SLACK_FILE_BYTES,
 );
 const calendarDraftRepository = new CalendarDraftRepository(env.CALENDAR_DRAFTS_TABLE_NAME);
-const googleCalendarClient = new GoogleCalendarClient({
-  secretProvider: () => secretsProvider.getSecretString(env.GOOGLE_CALENDAR_SECRET_ID),
-  defaultTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
-});
 const memoryItemRepository = new MemoryItemRepository(env.MEMORY_ITEMS_TABLE_NAME);
 const channelMemoryRepository = new ChannelMemoryRepository(env.MEMORY_ITEMS_TABLE_NAME);
 const conversationSessionRepository = new ConversationSessionRepository(env.CONVERSATION_SESSIONS_TABLE_NAME);
@@ -58,6 +55,7 @@ const taskEventRepository = new TaskEventRepository(env.TASK_EVENTS_TABLE_NAME);
 const taskStateRepository = new TaskStateRepository(env.TASKS_TABLE_NAME);
 const userMemoryRepository = new UserMemoryRepository(env.USER_MEMORY_TABLE_NAME);
 const userPreferenceRepository = new UserPreferenceRepository(env.MEMORY_ITEMS_TABLE_NAME);
+const googleOAuthConnectionRepository = new GoogleOAuthConnectionRepository(env.GOOGLE_OAUTH_CONNECTIONS_TABLE_NAME);
 const memoryStoreService = new MemoryStoreService(userMemoryRepository, claudeClient);
 const attachmentArchiveService = new SlackAttachmentArchiveService(
   env.SLACK_ATTACHMENT_ARCHIVE_BUCKET_NAME,
@@ -206,7 +204,16 @@ export async function handler(event: SQSEvent): Promise<void> {
         },
       },
       {
-        googleCalendar: googleCalendarClient,
+        googleCalendarProvider: () =>
+          createUserGoogleCalendarClient({
+            workspaceId: queueMessage.workspaceId,
+            userId: queueMessage.userId,
+            defaultTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
+            googleCalendarSecretId: env.GOOGLE_CALENDAR_SECRET_ID,
+            googleOAuthStartUrl: env.GOOGLE_OAUTH_START_URL,
+            secretsProvider,
+            connections: googleOAuthConnectionRepository,
+          }),
         defaultCalendarTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
       },
     );

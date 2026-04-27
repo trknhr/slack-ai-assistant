@@ -115,17 +115,23 @@ src/
 3. If your MCP setup requires it, prepare one or more `vault_ids`
 4. Bootstrap CDK in the target AWS account and region
 
-Google Calendar secret JSON for the current MVP:
+Google Calendar OAuth client secret JSON:
 
 ```json
 {
   "client_id": "YOUR_GOOGLE_OAUTH_CLIENT_ID",
   "client_secret": "YOUR_GOOGLE_OAUTH_CLIENT_SECRET",
-  "refresh_token": "YOUR_GOOGLE_REFRESH_TOKEN",
   "calendar_id": "primary",
   "time_zone": "Asia/Tokyo"
 }
 ```
+
+Each Slack user connects their own Google Calendar through:
+
+- `GET /oauth/google/start`
+- `GET /oauth/google/callback`
+
+Add the deployed `GoogleOAuthCallbackUrl` output as an authorized redirect URI in the Google Cloud OAuth client. Calendar tools run with the Google account connected to the Slack user who requested the action.
 
 ## Deploy
 
@@ -135,13 +141,15 @@ npx cdk deploy \
   -c anthropicAgentId=agent_0123456789 \
   -c anthropicEnvironmentId=env_0123456789 \
   -c anthropicVaultIds=vlt_0123456789 \
-  -c defaultScheduleChannel=C0123456789
+  -c defaultScheduleChannel=C0123456789 \
+  -c publicBaseUrl=https://your-api-id.execute-api.ap-northeast-1.amazonaws.com/prod
 ```
 
 Notes:
 
 - `defaultScheduleChannel` lets the scheduled runner create a fallback task automatically if `daily-summary` is missing.
 - `anthropicVaultIds` accepts a comma-separated list.
+- `publicBaseUrl` is used inside Slack replies when a user needs to connect Google Calendar.
 - `googleCalendarSecretName` and `googleCalendarTimeZone` can be overridden with CDK context if needed.
 
 ## Sync custom tools to the Managed Agent
@@ -184,7 +192,7 @@ Recommended flow:
 Notes:
 
 - The app uses the Google Calendar REST API directly from Lambda.
-- The current MVP connects one Google account through a single refresh-token secret.
+- Slack users authorize their own Google Calendar accounts through OAuth.
 - All-day events use date-only values and are written with Google Calendar's exclusive end-date semantics under the hood.
 - Draft application is idempotent across re-imports by storing app-specific private extended properties on events.
 

@@ -1,6 +1,6 @@
 import type { EventBridgeEvent } from "aws-lambda";
 import { SecretsProvider } from "../../aws/secretsProvider";
-import { GoogleCalendarClient } from "../../calendar/googleCalendarClient";
+import { createUserGoogleCalendarClient } from "../../calendar/userGoogleCalendar";
 import { AnthropicManagedAgentsClient } from "../../claude/client";
 import { createSession } from "../../claude/createSession";
 import { sendUserMessage } from "../../claude/sendUserMessage";
@@ -8,6 +8,7 @@ import { waitForCompletion } from "../../claude/waitForCompletion";
 import { loadSchedulerEnv } from "../../config/env";
 import { SCHEDULED_MEMORY_RESOURCE_PROMPT } from "../../memory/instructions";
 import { CalendarDraftRepository } from "../../repo/calendarDraftRepository";
+import { GoogleOAuthConnectionRepository } from "../../repo/googleOAuthConnectionRepository";
 import { MemoryItemRepository } from "../../repo/memoryItemRepository";
 import { SessionRepository } from "../../repo/sessionRepository";
 import { TaskEventRepository } from "../../repo/taskEventRepository";
@@ -42,10 +43,7 @@ const slackClient = new SlackWebClient(() =>
   secretsProvider.getSecretString(env.SLACK_BOT_TOKEN_SECRET_ID),
 );
 const calendarDraftRepository = new CalendarDraftRepository(env.CALENDAR_DRAFTS_TABLE_NAME);
-const googleCalendarClient = new GoogleCalendarClient({
-  secretProvider: () => secretsProvider.getSecretString(env.GOOGLE_CALENDAR_SECRET_ID),
-  defaultTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
-});
+const googleOAuthConnectionRepository = new GoogleOAuthConnectionRepository(env.GOOGLE_OAUTH_CONNECTIONS_TABLE_NAME);
 const slackAuthClient = new SlackAuthClient(() =>
   secretsProvider.getSecretString(env.SLACK_BOT_TOKEN_SECRET_ID),
 );
@@ -126,7 +124,16 @@ export async function handler(
       logger: log,
     },
     {
-      googleCalendar: googleCalendarClient,
+      googleCalendarProvider: () =>
+        createUserGoogleCalendarClient({
+          workspaceId: task.workspaceId,
+          userId: undefined,
+          defaultTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
+          googleCalendarSecretId: env.GOOGLE_CALENDAR_SECRET_ID,
+          googleOAuthStartUrl: env.GOOGLE_OAUTH_START_URL,
+          secretsProvider,
+          connections: googleOAuthConnectionRepository,
+        }),
       defaultCalendarTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
     },
   );
