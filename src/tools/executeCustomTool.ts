@@ -22,6 +22,7 @@ const searchMemoriesSchema = z.object({
 const saveMemorySchema = z.object({
   text: z.string().min(1),
   scope: z.enum(["channel", "user_preference", "workspace"]).optional(),
+  origin: z.enum(["explicit", "inferred", "imported"]).optional(),
   entity_key: z.string().min(1).optional(),
   attributes: z.record(z.string(), z.unknown()).optional(),
   tags: z.array(z.string().min(1)).optional(),
@@ -197,6 +198,11 @@ export interface ToolExecutionContext {
   userId?: string;
   channelId?: string;
   logger: Logger;
+  memoryWritePolicy?: {
+    allowWorkspaceMemory?: boolean;
+    channelInferredStatus?: "active" | "candidate";
+    defaultOrigin?: "explicit" | "inferred" | "imported";
+  };
 }
 
 interface ToolRepositories {
@@ -381,6 +387,7 @@ export class CustomToolExecutor {
   private async saveMemory(input: Record<string, unknown>): Promise<ToolExecutionResult> {
     const parsed = saveMemorySchema.parse(input);
     const scope = parsed.scope ?? inferSaveScope(this.context);
+    const origin = parsed.origin ?? this.context.memoryWritePolicy?.defaultOrigin ?? "explicit";
     const entityKey = normalizeEntityKey(parsed.entity_key);
     const tags = normalizeTags(parsed.tags);
 
@@ -389,6 +396,10 @@ export class CustomToolExecutor {
         return errorResult("Channel-scoped memory is unavailable in this context.");
       }
 
+      const status =
+        origin === "explicit"
+          ? "active"
+          : this.context.memoryWritePolicy?.channelInferredStatus ?? "active";
       const memory = await this.repositories.channelMemories.save({
         workspaceId: this.context.workspaceId,
         channelId: this.context.channelId,
@@ -397,8 +408,8 @@ export class CustomToolExecutor {
         attributes: parsed.attributes,
         tags,
         importance: parsed.importance,
-        status: "active",
-        origin: "explicit",
+        status,
+        origin,
         sourceType: "agent",
         createdByUserId: this.context.userId,
       });
@@ -411,6 +422,9 @@ export class CustomToolExecutor {
         entity_key: memory.entityKey,
         text: memory.text,
         tags: memory.tags ?? [],
+        status: memory.status,
+        origin: memory.origin,
+        approval_required: memory.status === "candidate",
         updated_at: memory.updatedAt,
       });
     }
@@ -429,7 +443,7 @@ export class CustomToolExecutor {
         attributes: parsed.attributes,
         tags,
         importance: parsed.importance,
-        origin: "explicit",
+        origin: origin === "imported" ? "inferred" : origin,
         sourceType: "agent",
         createdByUserId: this.context.userId,
       });
@@ -445,6 +459,12 @@ export class CustomToolExecutor {
         tags: preference.tags ?? [],
         updated_at: preference.updatedAt,
       });
+    }
+
+    if (this.context.memoryWritePolicy?.allowWorkspaceMemory === false) {
+      return errorResult(
+        "Workspace-scoped memory cannot be saved from this context. Use channel or user_preference memory instead.",
+      );
     }
 
     const memory = await this.repositories.memoryItems.save({

@@ -198,6 +198,11 @@ export async function handler(event: SQSEvent): Promise<void> {
         userId: queueMessage.userId,
         channelId: queueMessage.channelId,
         logger: log,
+        memoryWritePolicy: {
+          allowWorkspaceMemory: false,
+          channelInferredStatus: "candidate",
+          defaultOrigin: "inferred",
+        },
       },
       {
         googleCalendar: googleCalendarClient,
@@ -215,20 +220,69 @@ export async function handler(event: SQSEvent): Promise<void> {
       }),
     });
 
+    const thinkingMessage = await slackClient.postMessage({
+      channel: queueMessage.channelId,
+      threadTs: queueMessage.replyThreadTs,
+      text: "考え中です...",
+    });
+    let lastThinkingText = "考え中です...";
+    const updateThinkingMessage = async (text: string): Promise<void> => {
+      if (!thinkingMessage.ts || text === lastThinkingText) {
+        return;
+      }
+
+      try {
+        await slackClient.updateMessage({
+          channel: queueMessage.channelId,
+          ts: thinkingMessage.ts,
+          threadTs: queueMessage.replyThreadTs,
+          text,
+        });
+        lastThinkingText = text;
+      } catch (error) {
+        log.warn("Failed to update Slack thinking message", {
+          error: error instanceof Error ? error.message : "Unknown Slack update error",
+        });
+      }
+    };
+
     const completion = await waitForCompletion(claudeClient, {
       sessionId: sessionRecord.claudeSessionId,
       sinceEventIds: seenEventIds,
       timeoutMs: env.AGENT_RESPONSE_TIMEOUT_MS,
-      onCustomToolUse: (event) => customToolExecutor.execute(event),
+      onCustomToolUse: async (event) => {
+        await updateThinkingMessage(describeToolProgress(event.name));
+        return customToolExecutor.execute(event);
+      },
     });
 
-    const postedMessage = await slackClient.postMessage({
-      channel: queueMessage.channelId,
-      threadTs: queueMessage.replyThreadTs,
-      text: completion.text,
-    });
+    if (thinkingMessage.ts) {
+      try {
+        await slackClient.updateMessage({
+          channel: queueMessage.channelId,
+          ts: thinkingMessage.ts,
+          threadTs: queueMessage.replyThreadTs,
+          text: completion.text,
+        });
+      } catch (error) {
+        log.warn("Failed to replace Slack thinking message; posting final response separately", {
+          error: error instanceof Error ? error.message : "Unknown Slack update error",
+        });
+        await slackClient.postMessage({
+          channel: queueMessage.channelId,
+          threadTs: queueMessage.replyThreadTs,
+          text: completion.text,
+        });
+      }
+    } else {
+      await slackClient.postMessage({
+        channel: queueMessage.channelId,
+        threadTs: queueMessage.replyThreadTs,
+        text: completion.text,
+      });
+    }
 
-    const assistantMessageTs = postedMessage.ts ?? createSyntheticSlackTs();
+    const assistantMessageTs = thinkingMessage.ts ?? createSyntheticSlackTs();
     await conversationTurnRepository.save({
       workspaceId: queueMessage.workspaceId,
       channelId: queueMessage.channelId,
@@ -335,4 +389,26 @@ function createSyntheticSlackTs(): string {
   const seconds = Math.floor(milliseconds / 1000);
   const micros = `${milliseconds % 1000}`.padStart(3, "0");
   return `${seconds}.${micros}000`;
+}
+
+function describeToolProgress(toolName: unknown): string {
+  switch (toolName) {
+    case "search_memories":
+      return "過去のメモを確認しています...";
+    case "save_memory":
+      return "覚えておく内容を整理しています...";
+    case "list_tasks":
+    case "upsert_task":
+    case "mark_task_done":
+      return "タスクを確認しています...";
+    case "list_calendar_events":
+    case "find_free_busy":
+    case "create_calendar_draft":
+    case "list_calendar_drafts":
+    case "apply_calendar_draft":
+    case "discard_calendar_draft":
+      return "カレンダーを確認しています...";
+    default:
+      return "処理しています...";
+  }
 }

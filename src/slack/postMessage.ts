@@ -6,6 +6,13 @@ export interface SlackPostMessageInput {
   threadTs?: string;
 }
 
+export interface SlackUpdateMessageInput {
+  channel: string;
+  ts: string;
+  text: string;
+  threadTs?: string;
+}
+
 interface SlackApiResponse {
   ok: boolean;
   ts?: string;
@@ -35,6 +42,25 @@ export class SlackWebClient {
     return {
       ts: firstMessageTs,
     };
+  }
+
+  async updateMessage(input: SlackUpdateMessageInput): Promise<void> {
+    const chunks = splitTextForSlack(normalizeTextForSlack(input.text));
+    const [firstChunk, ...remainingChunks] = chunks;
+
+    await this.call("chat.update", {
+      channel: input.channel,
+      ts: input.ts,
+      text: firstChunk,
+    });
+
+    for (const chunk of remainingChunks) {
+      await this.call("chat.postMessage", {
+        channel: input.channel,
+        text: chunk,
+        thread_ts: input.threadTs ?? input.ts,
+      });
+    }
   }
 
   private async call(method: string, body: Record<string, unknown>): Promise<SlackApiResponse> {

@@ -29,7 +29,7 @@ export const customToolDefinitions = [
   {
     name: "save_memory",
     description:
-      "Save a durable memory. Use scope=user_preference for personal preferences like preferred name, language, or style. Use scope=channel for stable channel-shared rules, decisions, and references. Save one memory per fact and do not save transient chatter or daily summaries.",
+      "Save a durable memory. Use scope=user_preference for personal preferences like preferred name, language, or style. Use scope=channel for stable channel-shared rules, decisions, and references. In Slack conversations, do not use scope=workspace. Save one memory per fact and do not save transient chatter or daily summaries.",
     input_schema: {
       type: "object",
       properties: {
@@ -42,6 +42,12 @@ export const customToolDefinitions = [
           enum: ["channel", "user_preference", "workspace"],
           description:
             "Where this memory should live. Prefer channel for channel-shared durable context, user_preference for personal preferences, and workspace only for legacy import or non-channel contexts.",
+        },
+        origin: {
+          type: "string",
+          enum: ["explicit", "inferred", "imported"],
+          description:
+            "Use explicit only when the user directly asked to remember or always apply the fact. Use inferred for facts derived from conversation. Use imported for document/import sources.",
         },
         entity_key: {
           type: "string",

@@ -17,6 +17,7 @@ import { logger } from "../../shared/logger";
 import { SlackAuthClient } from "../../slack/authTest";
 import { SlackWebClient } from "../../slack/postMessage";
 import { ScheduledTask } from "../../tasks/taskDefinition";
+import { TaskState } from "../../tasks/taskState";
 import { CustomToolExecutor } from "../../tools/executeCustomTool";
 
 interface SchedulerPayload {
@@ -78,6 +79,8 @@ export async function handler(
     throw new Error(`Scheduled task ${taskId} is disabled`);
   }
 
+  const autoClosedTasks = await autoCloseExpiredTasks(task.workspaceId, scheduledAtIso, log);
+
   const reusableSessionRecord = task.reuseSession
     ? await sessionRepository.findByThread(task.workspaceId, task.outputChannelId, task.taskId)
     : null;
@@ -133,7 +136,7 @@ export async function handler(
     content: [
       {
         type: "text",
-        text: buildScheduledPrompt(task.prompt, scheduledAtIso),
+        text: buildScheduledPrompt(task.prompt, scheduledAtIso, autoClosedTasks),
       },
     ],
   });
@@ -163,7 +166,79 @@ export async function handler(
     });
   }
 
-  log.info("Scheduled task completed", { sessionId, status: completion.status });
+  log.info("Scheduled task completed", {
+    sessionId,
+    status: completion.status,
+    autoClosedTaskCount: autoClosedTasks.length,
+  });
+}
+
+async function autoCloseExpiredTasks(
+  workspaceId: string,
+  scheduledAtIso: string,
+  log: ReturnType<typeof logger.child>,
+): Promise<TaskState[]> {
+  const scheduledAt = new Date(scheduledAtIso);
+  const now = Number.isNaN(scheduledAt.getTime()) ? new Date() : scheduledAt;
+  const today = formatInTimeZone(now, SCHEDULE_TIMEZONE).date;
+  const candidates = await taskStateRepository.list({
+    workspaceId,
+    statuses: ["open", "in_progress"],
+    limit: 50,
+  });
+  const expiredTasks = candidates.filter((task) => isExpiredTaskDueAt(task.dueAt, now, today));
+  const closedTasks: TaskState[] = [];
+
+  for (const task of expiredTasks) {
+    const closedTask = await taskStateRepository.upsert({
+      ...task,
+      status: "cancelled",
+      taskId: task.taskId,
+      workspaceId: task.workspaceId,
+      metadata: {
+        ...task.metadata,
+        autoClosedReason: "expired",
+        autoClosedAt: now.toISOString(),
+      },
+    });
+    closedTasks.push(closedTask);
+
+    await taskEventRepository.save({
+      taskId: closedTask.taskId,
+      type: "updated",
+      payload: {
+        status: closedTask.status,
+        due_at: closedTask.dueAt,
+        auto_closed_reason: "expired",
+      },
+    });
+  }
+
+  if (closedTasks.length > 0) {
+    log.info("Auto-closed expired tasks", {
+      count: closedTasks.length,
+      taskIds: closedTasks.map((task) => task.taskId),
+    });
+  }
+
+  return closedTasks;
+}
+
+function isExpiredTaskDueAt(dueAt: string | undefined, now: Date, today: string): boolean {
+  if (!dueAt) {
+    return false;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dueAt)) {
+    return dueAt < today;
+  }
+
+  const dueDate = new Date(dueAt);
+  if (Number.isNaN(dueDate.getTime())) {
+    return false;
+  }
+
+  return dueDate.getTime() < now.getTime();
 }
 
 async function buildFallbackTask(
@@ -237,21 +312,32 @@ function resolveScheduledAtIso(
   return new Date().toISOString();
 }
 
-function buildScheduledPrompt(basePrompt: string, scheduledAtIso: string): string {
+function buildScheduledPrompt(
+  basePrompt: string,
+  scheduledAtIso: string,
+  autoClosedTasks: TaskState[] = [],
+): string {
   const date = new Date(scheduledAtIso);
   if (Number.isNaN(date.getTime())) {
     return basePrompt;
   }
 
   const parts = formatInTimeZone(date, SCHEDULE_TIMEZONE);
-  return [
+  const promptParts = [
     "Scheduling context:",
     `- Current scheduled run time: ${parts.date} ${parts.time} (${parts.weekday})`,
     `- Time zone: ${SCHEDULE_TIMEZONE}`,
     "- Interpret relative dates such as today, yesterday, and tomorrow using this time zone, not UTC.",
-    "",
-    basePrompt,
-  ].join("\n");
+  ];
+
+  if (autoClosedTasks.length > 0) {
+    promptParts.push(
+      "- The system already closed these expired tasks before this run. Mention this in one short sentence, and do not list them as current or upcoming tasks.",
+      ...autoClosedTasks.map((task) => `  - ${task.title}${task.dueAt ? ` (due: ${task.dueAt})` : ""}`),
+    );
+  }
+
+  return [...promptParts, "", basePrompt].join("\n");
 }
 
 function formatInTimeZone(date: Date, timeZone: string): {
