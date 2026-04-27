@@ -227,11 +227,13 @@ export interface ToolExecutionResult {
 export interface ToolExecutionSummary {
   savedMemoryIds: string[];
   taskIds: string[];
+  calendarDraftIds: string[];
 }
 
 export class CustomToolExecutor {
   private readonly savedMemoryIds = new Set<string>();
   private readonly taskIds = new Set<string>();
+  private readonly calendarDraftIds = new Set<string>();
 
   constructor(
     private readonly repositories: ToolRepositories,
@@ -298,6 +300,7 @@ export class CustomToolExecutor {
     return {
       savedMemoryIds: [...this.savedMemoryIds],
       taskIds: [...this.taskIds],
+      calendarDraftIds: [...this.calendarDraftIds],
     };
   }
 
@@ -668,6 +671,7 @@ export class CustomToolExecutor {
     };
 
     await draftRepository.save(draft);
+    this.calendarDraftIds.add(draft.draftId);
 
     return jsonResult({
       saved: true,

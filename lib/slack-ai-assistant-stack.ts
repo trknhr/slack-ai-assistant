@@ -300,6 +300,21 @@ export class SlackAiAssistantStack extends Stack {
       },
     });
 
+    const slackInteractions = new nodejs.NodejsFunction(this, "SlackInteractionsFunction", {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      entry: join(__dirname, "../src/functions/slack-interactions/index.ts"),
+      handler: "handler",
+      timeout: Duration.seconds(30),
+      memorySize: 512,
+      environment: {
+        ...commonEnvironment,
+        ...toolEnvironment,
+      },
+      bundling: {
+        target: "node20",
+      },
+    });
+
     worker.addEventSource(
       new eventsources.SqsEventSource(slackEventsQueue, {
         batchSize: 1,
@@ -331,17 +346,21 @@ export class SlackAiAssistantStack extends Stack {
     tasksTable.grantReadWriteData(scheduledRunner);
     tasksTable.grantReadWriteData(documentImportWorker);
     tasksTable.grantReadWriteData(chatApi);
+    tasksTable.grantReadWriteData(slackInteractions);
     calendarDraftsTable.grantReadWriteData(worker);
     calendarDraftsTable.grantReadWriteData(scheduledRunner);
     calendarDraftsTable.grantReadWriteData(documentImportWorker);
     calendarDraftsTable.grantReadWriteData(chatApi);
+    calendarDraftsTable.grantReadWriteData(slackInteractions);
     taskEventsTable.grantReadWriteData(worker);
     taskEventsTable.grantReadWriteData(scheduledRunner);
     taskEventsTable.grantReadWriteData(documentImportWorker);
     taskEventsTable.grantReadWriteData(chatApi);
+    taskEventsTable.grantReadWriteData(slackInteractions);
     processedEventsTable.grantReadWriteData(ingress);
     scheduledTasksTable.grantReadWriteData(scheduledRunner);
     userMemoryTable.grantReadWriteData(chatApi);
+    memoryItemsTable.grantReadWriteData(slackInteractions);
     attachmentArchiveBucket.grantPut(worker, "raw/private/slack/*");
     attachmentArchiveBucket.grantPut(documentImportApi, "raw/private/imports/*");
     attachmentArchiveBucket.grantPut(documentImportApi, "raw/private/notes/*");
@@ -373,8 +392,10 @@ export class SlackAiAssistantStack extends Stack {
     );
 
     slackSigningSecret.grantRead(ingress);
+    slackSigningSecret.grantRead(slackInteractions);
     slackBotTokenSecret.grantRead(worker);
     slackBotTokenSecret.grantRead(scheduledRunner);
+    slackBotTokenSecret.grantRead(slackInteractions);
     anthropicApiKeySecret.grantRead(worker);
     anthropicApiKeySecret.grantRead(scheduledRunner);
     anthropicApiKeySecret.grantRead(documentImportWorker);
@@ -383,6 +404,7 @@ export class SlackAiAssistantStack extends Stack {
     googleCalendarSecret.grantRead(scheduledRunner);
     googleCalendarSecret.grantRead(documentImportWorker);
     googleCalendarSecret.grantRead(chatApi);
+    googleCalendarSecret.grantRead(slackInteractions);
 
     const api = new apigateway.RestApi(this, "SlackEventsApi", {
       restApiName: "slack-ai-assistant-events",
@@ -393,6 +415,10 @@ export class SlackAiAssistantStack extends Stack {
 
     const slackEventsResource = api.root.addResource("slack").addResource("events");
     slackEventsResource.addMethod("POST", new apigateway.LambdaIntegration(ingress));
+    api.root
+      .getResource("slack")!
+      .addResource("interactions")
+      .addMethod("POST", new apigateway.LambdaIntegration(slackInteractions));
     const importsResource = api.root.addResource("imports");
     importsResource.addResource("uploads").addMethod("POST", new apigateway.LambdaIntegration(documentImportApi), {
       authorizationType: apigateway.AuthorizationType.IAM,
@@ -472,6 +498,12 @@ export class SlackAiAssistantStack extends Stack {
     });
     new cdk.CfnOutput(this, "SlackEventsWorkerFunctionName", {
       value: worker.functionName,
+    });
+    new cdk.CfnOutput(this, "SlackInteractionsUrl", {
+      value: `${api.url}slack/interactions`,
+    });
+    new cdk.CfnOutput(this, "SlackInteractionsFunctionName", {
+      value: slackInteractions.functionName,
     });
     new cdk.CfnOutput(this, "ScheduledTasksTableName", {
       value: scheduledTasksTable.tableName,

@@ -1,5 +1,6 @@
 import type { SQSEvent } from "aws-lambda";
 import { SecretsProvider } from "../../aws/secretsProvider";
+import { CalendarDraft } from "../../calendar/calendarDraft";
 import { buildSlackContextBlocks, buildTurnText } from "../../conversations/buildSlackContextBlocks";
 import { AnthropicManagedAgentsClient } from "../../claude/client";
 import { createSession } from "../../claude/createSession";
@@ -24,7 +25,7 @@ import { logger } from "../../shared/logger";
 import { SlackConversationsClient, SlackThreadMessage } from "../../slack/conversationsClient";
 import { SlackFilesClient } from "../../slack/filesClient";
 import { SlackAttachmentArchiveService } from "../../slack/slackAttachmentArchiveService";
-import { SlackWebClient } from "../../slack/postMessage";
+import { SlackBlock, SlackWebClient } from "../../slack/postMessage";
 import { CustomToolExecutor } from "../../tools/executeCustomTool";
 
 const env = loadWorkerEnv();
@@ -255,6 +256,7 @@ export async function handler(event: SQSEvent): Promise<void> {
         return customToolExecutor.execute(event);
       },
     });
+    const summary = customToolExecutor.getSummary();
 
     if (thinkingMessage.ts) {
       try {
@@ -297,6 +299,22 @@ export async function handler(event: SQSEvent): Promise<void> {
       text: completion.text,
     });
 
+    for (const draftId of summary.calendarDraftIds) {
+      const draft = await calendarDraftRepository.get(queueMessage.workspaceId, queueMessage.userId, draftId);
+      if (!draft) {
+        continue;
+      }
+      await slackClient.postMessage({
+        channel: queueMessage.channelId,
+        threadTs: queueMessage.replyThreadTs ?? assistantMessageTs,
+        text: buildCalendarDraftApprovalText(draft),
+        blocks: buildCalendarDraftApprovalBlocks(draft, {
+          channelId: queueMessage.channelId,
+          messageTs: assistantMessageTs,
+        }),
+      });
+    }
+
     await conversationSessionRepository.save({
       ...sessionRecord,
       memoryStoreId,
@@ -312,6 +330,83 @@ export async function handler(event: SQSEvent): Promise<void> {
       archivedAttachmentCount: preparedAttachments.filter((attachment) => attachment.status === "ready").length,
     });
   }
+}
+
+function buildCalendarDraftApprovalText(draft: CalendarDraft): string {
+  const candidateLines = draft.candidates
+    .filter((candidate) => candidate.status === "pending")
+    .slice(0, 5)
+    .map((candidate) => `- ${candidate.summary} (${formatCalendarCandidateTime(candidate)})`);
+  return [
+    `カレンダー下書き「${draft.title}」を作成しました。`,
+    ...candidateLines,
+    "作成してよければ承認してください。",
+  ].join("\n");
+}
+
+function buildCalendarDraftApprovalBlocks(
+  draft: CalendarDraft,
+  context: { channelId: string; messageTs: string },
+): SlackBlock[] {
+  const pendingCandidates = draft.candidates.filter((candidate) => candidate.status === "pending");
+  const candidateText = pendingCandidates
+    .slice(0, 5)
+    .map((candidate) => `• ${candidate.summary} (${formatCalendarCandidateTime(candidate)})`)
+    .join("\n");
+  const suffix = pendingCandidates.length > 5 ? `\n他 ${pendingCandidates.length - 5} 件` : "";
+
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*カレンダー下書き*: ${draft.title}\n${candidateText || "承認待ち候補はありません。"}${suffix}`,
+      },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "承認して作成" },
+          style: "primary",
+          action_id: "calendar_draft_approve",
+          value: JSON.stringify({
+            action: "approve",
+            workspaceId: draft.workspaceId,
+            userId: draft.userId,
+            draftId: draft.draftId,
+            channelId: context.channelId,
+            messageTs: context.messageTs,
+          }),
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "却下" },
+          style: "danger",
+          action_id: "calendar_draft_reject",
+          value: JSON.stringify({
+            action: "reject",
+            workspaceId: draft.workspaceId,
+            userId: draft.userId,
+            draftId: draft.draftId,
+            channelId: context.channelId,
+            messageTs: context.messageTs,
+          }),
+        },
+      ],
+    },
+  ];
+}
+
+function formatCalendarCandidateTime(candidate: CalendarDraft["candidates"][number]): string {
+  if (candidate.allDay) {
+    return candidate.endDate && candidate.endDate !== candidate.startDate
+      ? `${candidate.startDate} - ${candidate.endDate}`
+      : candidate.startDate ?? "日時未定";
+  }
+
+  return candidate.endAt ? `${candidate.startAt} - ${candidate.endAt}` : candidate.startAt ?? "日時未定";
 }
 
 function createConversationSession(

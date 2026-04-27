@@ -1,9 +1,12 @@
 import { normalizeTextForSlack, splitTextForSlack } from "../shared/text";
 
+export type SlackBlock = Record<string, unknown>;
+
 export interface SlackPostMessageInput {
   channel: string;
   text: string;
   threadTs?: string;
+  blocks?: SlackBlock[];
 }
 
 export interface SlackUpdateMessageInput {
@@ -11,6 +14,7 @@ export interface SlackUpdateMessageInput {
   ts: string;
   text: string;
   threadTs?: string;
+  blocks?: SlackBlock[];
 }
 
 interface SlackApiResponse {
@@ -30,11 +34,12 @@ export class SlackWebClient {
     const chunks = splitTextForSlack(normalizeTextForSlack(input.text));
     let firstMessageTs: string | undefined;
 
-    for (const chunk of chunks) {
+    for (const [index, chunk] of chunks.entries()) {
       const response = await this.call("chat.postMessage", {
         channel: input.channel,
         text: chunk,
         thread_ts: input.threadTs,
+        blocks: index === 0 ? input.blocks : undefined,
       });
       firstMessageTs ??= response.ts;
     }
@@ -52,6 +57,7 @@ export class SlackWebClient {
       channel: input.channel,
       ts: input.ts,
       text: firstChunk,
+      blocks: input.blocks,
     });
 
     for (const chunk of remainingChunks) {

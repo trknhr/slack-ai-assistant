@@ -75,12 +75,15 @@ const chatApiEnvSchema = toolRuntimeEnvSchema;
 
 const schedulerEnvSchema = toolRuntimeEnvSchema;
 
+const slackInteractionsEnvSchema = toolRuntimeEnvSchema;
+
 export type IngressEnv = z.infer<typeof ingressEnvSchema>;
 export type WorkerEnv = z.infer<typeof workerEnvSchema>;
 export type ImportApiEnv = z.infer<typeof importApiEnvSchema>;
 export type ImportWorkerEnv = z.infer<typeof importWorkerEnvSchema>;
 export type ChatApiEnv = z.infer<typeof chatApiEnvSchema>;
 export type SchedulerEnv = z.infer<typeof schedulerEnvSchema>;
+export type SlackInteractionsEnv = z.infer<typeof slackInteractionsEnvSchema>;
 
 export function loadIngressEnv(): IngressEnv {
   return ingressEnvSchema.parse(process.env);
@@ -104,4 +107,8 @@ export function loadChatApiEnv(): ChatApiEnv {
 
 export function loadSchedulerEnv(): SchedulerEnv {
   return schedulerEnvSchema.parse(process.env);
+}
+
+export function loadSlackInteractionsEnv(): SlackInteractionsEnv {
+  return slackInteractionsEnvSchema.parse(process.env);
 }
