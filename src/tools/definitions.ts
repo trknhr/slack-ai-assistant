@@ -120,13 +120,35 @@ export const customToolDefinitions = [
     },
   },
   {
+    name: "list_google_calendars",
+    description:
+      "List Google calendars available to the connected user, including access roles. Use this before targeting a named non-primary calendar such as Family.",
+    input_schema: {
+      type: "object",
+      properties: {
+        min_access_role: {
+          type: "string",
+          enum: ["freeBusyReader", "reader", "writer", "owner"],
+          description:
+            "Minimum access role to return. Use reader to find readable calendars, writer to find calendars where events can be created.",
+        },
+        query: { type: "string", description: "Optional calendar name search, such as Family." },
+        limit: { type: "integer", minimum: 1, maximum: 100 },
+      },
+    },
+  },
+  {
     name: "list_calendar_events",
     description:
-      "Inspect Google Calendar events before creating or changing anything. Use this to avoid duplicates and review what is already on the calendar.",
+      "Inspect Google Calendar events before creating or changing anything. Use this to avoid duplicates and review what is already on the calendar. Use calendar_name when the user names a non-primary calendar such as Family.",
     input_schema: {
       type: "object",
       properties: {
         calendar_id: { type: "string" },
+        calendar_name: {
+          type: "string",
+          description: "Human calendar name to resolve with reader access or higher, such as Family.",
+        },
         time_min: { type: "string", description: "RFC3339 lower bound for the event search window." },
         time_max: { type: "string", description: "RFC3339 upper bound for the event search window." },
         time_zone: { type: "string", description: "IANA time zone for the response, such as Asia/Tokyo." },
@@ -145,6 +167,11 @@ export const customToolDefinitions = [
           type: "array",
           items: { type: "string" },
           description: "Optional calendar IDs. Omit to query the default connected calendar.",
+        },
+        calendar_names: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional calendar names to resolve with free/busy access or higher, such as Family.",
         },
         time_min: { type: "string", description: "RFC3339 lower bound." },
         time_max: { type: "string", description: "RFC3339 upper bound." },
@@ -165,6 +192,10 @@ export const customToolDefinitions = [
         source_id: { type: "string" },
         source_ref: { type: "string" },
         calendar_id: { type: "string" },
+        calendar_name: {
+          type: "string",
+          description: "Human calendar name to resolve with writer access or higher, such as Family.",
+        },
         candidates: {
           type: "array",
           items: {
@@ -221,6 +252,10 @@ export const customToolDefinitions = [
       properties: {
         draft_id: { type: "string" },
         calendar_id: { type: "string" },
+        calendar_name: {
+          type: "string",
+          description: "Human calendar name to resolve with writer access or higher, such as Family.",
+        },
         candidate_ids: {
           type: "array",
           items: { type: "string" },

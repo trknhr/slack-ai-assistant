@@ -1,7 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { CalendarDraft, CalendarDraftCandidate, CalendarDraftStatus } from "../calendar/calendarDraft";
-import { GoogleCalendarClient } from "../calendar/googleCalendarClient";
+import {
+  GoogleCalendarAccessRole,
+  GoogleCalendarClient,
+  GoogleCalendarListEntry,
+} from "../calendar/googleCalendarClient";
 import { ClaudeInputBlock, ClaudeSessionEvent } from "../claude/client";
 import { CalendarDraftRepository } from "../repo/calendarDraftRepository";
 import { ChannelMemoryRepository } from "../repo/channelMemoryRepository";
@@ -56,6 +60,7 @@ const markTaskDoneSchema = z.object({
 
 const listCalendarEventsSchema = z.object({
   calendar_id: z.string().min(1).optional(),
+  calendar_name: z.string().min(1).optional(),
   time_min: z.string().min(1).optional(),
   time_max: z.string().min(1).optional(),
   time_zone: z.string().min(1).optional(),
@@ -63,8 +68,15 @@ const listCalendarEventsSchema = z.object({
   limit: z.number().int().min(1).max(50).optional(),
 });
 
+const listGoogleCalendarsSchema = z.object({
+  min_access_role: z.enum(["freeBusyReader", "reader", "writer", "owner"]).optional(),
+  query: z.string().min(1).optional(),
+  limit: z.number().int().min(1).max(100).optional(),
+});
+
 const findFreeBusySchema = z.object({
   calendar_ids: z.array(z.string().min(1)).optional(),
+  calendar_names: z.array(z.string().min(1)).optional(),
   time_min: z.string().min(1),
   time_max: z.string().min(1),
   time_zone: z.string().min(1).optional(),
@@ -158,6 +170,7 @@ const createCalendarDraftSchema = z.object({
   source_id: z.string().min(1).optional(),
   source_ref: z.string().min(1).optional(),
   calendar_id: z.string().min(1).optional(),
+  calendar_name: z.string().min(1).optional(),
   candidates: z.array(calendarDraftCandidateSchema).min(1).max(50),
 });
 
@@ -169,6 +182,7 @@ const listCalendarDraftsSchema = z.object({
 const applyCalendarDraftSchema = z.object({
   draft_id: z.string().min(1),
   calendar_id: z.string().min(1).optional(),
+  calendar_name: z.string().min(1).optional(),
   candidate_ids: z.array(z.string().min(1)).optional(),
 });
 
@@ -188,8 +202,10 @@ const CALENDAR_PRIVATE_PROPERTY_KEYS = {
   sourceId: "slackai_source",
 } as const;
 const CALENDAR_TOOL_NAMES = new Set([
+  "list_google_calendars",
   "list_calendar_events",
   "find_free_busy",
+  "create_calendar_draft",
   "apply_calendar_draft",
 ]);
 
@@ -266,6 +282,8 @@ export class CustomToolExecutor {
           return await this.upsertTask(input);
         case "mark_task_done":
           return await this.markTaskDone(input);
+        case "list_google_calendars":
+          return await this.listGoogleCalendars(input);
         case "list_calendar_events":
           return await this.listCalendarEvents(input);
         case "find_free_busy":
@@ -591,14 +609,38 @@ export class CustomToolExecutor {
     });
   }
 
+  private async listGoogleCalendars(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = listGoogleCalendarsSchema.parse(input);
+    const calendar = await this.requireGoogleCalendar();
+    const result = await calendar.listCalendars({
+      minAccessRole: parsed.min_access_role,
+      maxResults: parsed.limit,
+    });
+    const query = parsed.query ? normalizeSearchText(parsed.query) : undefined;
+    const calendars = query
+      ? result.calendars.filter((entry) => calendarMatchesQuery(entry, query))
+      : result.calendars;
+
+    return jsonResult({
+      count: calendars.length,
+      calendars: calendars.map(serializeGoogleCalendarListEntry),
+    });
+  }
+
   private async listCalendarEvents(input: Record<string, unknown>): Promise<ToolExecutionResult> {
     const parsed = listCalendarEventsSchema.parse(input);
     const calendar = await this.requireGoogleCalendar();
     const timeMin = parsed.time_min ?? new Date().toISOString();
     const timeMax = parsed.time_max ?? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    const calendarId = await this.resolveCalendarId({
+      calendar,
+      calendarId: parsed.calendar_id,
+      calendarName: parsed.calendar_name,
+      minAccessRole: "reader",
+    });
 
     const result = await calendar.listEvents({
-      calendarId: parsed.calendar_id,
+      calendarId,
       timeMin,
       timeMax,
       timeZone: parsed.time_zone ?? this.getDefaultCalendarTimeZone(),
@@ -628,8 +670,14 @@ export class CustomToolExecutor {
   private async findFreeBusy(input: Record<string, unknown>): Promise<ToolExecutionResult> {
     const parsed = findFreeBusySchema.parse(input);
     const calendar = await this.requireGoogleCalendar();
-    const result = await calendar.queryFreeBusy({
+    const resolvedCalendarIds = await this.resolveCalendarIds({
+      calendar,
       calendarIds: parsed.calendar_ids,
+      calendarNames: parsed.calendar_names,
+      minAccessRole: "freeBusyReader",
+    });
+    const result = await calendar.queryFreeBusy({
+      calendarIds: resolvedCalendarIds,
       timeMin: parsed.time_min,
       timeMax: parsed.time_max,
       timeZone: parsed.time_zone ?? this.getDefaultCalendarTimeZone(),
@@ -655,6 +703,12 @@ export class CustomToolExecutor {
         sourceRef: parsed.source_ref,
       }),
     );
+    const calendarId = await this.resolveCalendarId({
+      calendar: parsed.calendar_name ? await this.requireGoogleCalendar() : undefined,
+      calendarId: parsed.calendar_id,
+      calendarName: parsed.calendar_name,
+      minAccessRole: "writer",
+    });
 
     const draft: CalendarDraft = {
       draftId,
@@ -664,7 +718,7 @@ export class CustomToolExecutor {
       notes: normalizeOptionalString(parsed.notes),
       sourceId: normalizeOptionalString(parsed.source_id),
       sourceRef: normalizeOptionalString(parsed.source_ref),
-      calendarId: normalizeOptionalString(parsed.calendar_id),
+      calendarId: normalizeOptionalString(calendarId),
       status: "pending",
       candidates,
       createdAt: now,
@@ -736,7 +790,12 @@ export class CustomToolExecutor {
       throw new Error("Rejected calendar draft candidates cannot be applied");
     }
 
-    const calendarId = parsed.calendar_id ?? draft.calendarId;
+    const calendarId = await this.resolveCalendarId({
+      calendar,
+      calendarId: parsed.calendar_id ?? draft.calendarId,
+      calendarName: parsed.calendar_name,
+      minAccessRole: "writer",
+    });
     const appliedAt = new Date().toISOString();
     const results: Array<{
       candidate_id: string;
@@ -905,6 +964,57 @@ export class CustomToolExecutor {
   private getDefaultCalendarTimeZone(): string {
     return this.integrations.defaultCalendarTimeZone ?? DEFAULT_CALENDAR_TIME_ZONE;
   }
+
+  private async resolveCalendarIds(input: {
+    calendar: GoogleCalendarClient;
+    calendarIds?: string[];
+    calendarNames?: string[];
+    minAccessRole: GoogleCalendarAccessRole;
+  }): Promise<string[] | undefined> {
+    const resolved = [...(input.calendarIds ?? [])];
+    for (const calendarName of input.calendarNames ?? []) {
+      const calendarId = await this.resolveCalendarId({
+        calendar: input.calendar,
+        calendarName,
+        minAccessRole: input.minAccessRole,
+      });
+      if (calendarId) {
+        resolved.push(calendarId);
+      }
+    }
+
+    return resolved.length > 0 ? [...new Set(resolved)] : undefined;
+  }
+
+  private async resolveCalendarId(input: {
+    calendar?: GoogleCalendarClient;
+    calendarId?: string;
+    calendarName?: string;
+    minAccessRole: GoogleCalendarAccessRole;
+  }): Promise<string | undefined> {
+    if (input.calendarId) {
+      return input.calendarId;
+    }
+    if (!input.calendarName) {
+      return undefined;
+    }
+    if (!input.calendar) {
+      throw new Error("Google Calendar is required to resolve a calendar name");
+    }
+
+    const result = await input.calendar.listCalendars({
+      minAccessRole: input.minAccessRole,
+      maxResults: 250,
+    });
+    const matched = findCalendarByName(result.calendars, input.calendarName);
+    if (!matched) {
+      throw new Error(
+        `Google Calendar named '${input.calendarName}' was not found with ${input.minAccessRole} access or higher.`,
+      );
+    }
+
+    return matched.id;
+  }
 }
 
 function jsonResult(payload: unknown): ToolExecutionResult {
@@ -965,6 +1075,64 @@ function inferSaveScope(context: ToolExecutionContext): "channel" | "user_prefer
   }
 
   return "workspace";
+}
+
+function serializeGoogleCalendarListEntry(entry: GoogleCalendarListEntry): Record<string, unknown> {
+  return {
+    calendar_id: entry.id,
+    summary: entry.summary,
+    summary_override: entry.summaryOverride,
+    description: entry.description,
+    time_zone: entry.timeZone,
+    access_role: entry.accessRole,
+    primary: entry.primary,
+    selected: entry.selected,
+    hidden: entry.hidden,
+  };
+}
+
+function findCalendarByName(
+  calendars: GoogleCalendarListEntry[],
+  calendarName: string,
+): GoogleCalendarListEntry | null {
+  const query = normalizeSearchText(calendarName);
+  const exactMatches = calendars.filter((entry) => calendarNameCandidates(entry).some((candidate) => candidate === query));
+  if (exactMatches.length === 1) {
+    return exactMatches[0];
+  }
+  if (exactMatches.length > 1) {
+    throw new Error(
+      `Google Calendar name '${calendarName}' matched multiple calendars: ${exactMatches
+        .map((entry) => entry.summary ?? entry.id)
+        .join(", ")}`,
+    );
+  }
+
+  const partialMatches = calendars.filter((entry) => calendarMatchesQuery(entry, query));
+  if (partialMatches.length === 1) {
+    return partialMatches[0];
+  }
+  if (partialMatches.length > 1) {
+    throw new Error(
+      `Google Calendar name '${calendarName}' matched multiple calendars: ${partialMatches
+        .map((entry) => entry.summary ?? entry.id)
+        .join(", ")}`,
+    );
+  }
+
+  return null;
+}
+
+function calendarMatchesQuery(entry: GoogleCalendarListEntry, query: string): boolean {
+  return calendarNameCandidates(entry).some((candidate) => candidate.includes(query));
+}
+
+function calendarNameCandidates(entry: GoogleCalendarListEntry): string[] {
+  return [entry.id, entry.summary, entry.summaryOverride].map((value) => normalizeSearchText(value)).filter(Boolean);
+}
+
+function normalizeSearchText(value: string | undefined): string {
+  return (value ?? "").trim().toLowerCase();
 }
 
 function normalizeCalendarDraftCandidate(

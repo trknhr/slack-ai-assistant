@@ -21,6 +21,22 @@ export interface GoogleCalendarEventRecord {
   };
 }
 
+export type GoogleCalendarAccessRole = "freeBusyReader" | "reader" | "writer" | "owner";
+
+export interface GoogleCalendarListEntry {
+  id: string;
+  summary?: string;
+  summaryOverride?: string;
+  description?: string;
+  timeZone?: string;
+  accessRole?: GoogleCalendarAccessRole;
+  primary?: boolean;
+  selected?: boolean;
+  hidden?: boolean;
+  backgroundColor?: string;
+  foregroundColor?: string;
+}
+
 interface GoogleOAuthToken {
   access_token: string;
   expires_in?: number;
@@ -127,6 +143,35 @@ export class GoogleCalendarClient {
       timeZone: input.timeZone ?? credentials.timeZone,
       events: response.items ?? [],
     };
+  }
+
+  async listCalendars(input: {
+    minAccessRole?: GoogleCalendarAccessRole;
+    maxResults?: number;
+  } = {}): Promise<{ calendars: GoogleCalendarListEntry[] }> {
+    const query = new URLSearchParams();
+    query.set("showDeleted", "false");
+    query.set("maxResults", `${Math.min(Math.max(input.maxResults ?? 100, 1), 250)}`);
+    if (input.minAccessRole) {
+      query.set("minAccessRole", input.minAccessRole);
+    }
+
+    const calendars: GoogleCalendarListEntry[] = [];
+    let pageToken: string | undefined;
+    do {
+      const pageQuery = new URLSearchParams(query);
+      if (pageToken) {
+        pageQuery.set("pageToken", pageToken);
+      }
+      const response = await this.requestJson<{
+        items?: GoogleCalendarListEntry[];
+        nextPageToken?: string;
+      }>("GET", `/calendar/v3/users/me/calendarList?${pageQuery.toString()}`);
+      calendars.push(...(response.items ?? []));
+      pageToken = response.nextPageToken;
+    } while (pageToken);
+
+    return { calendars };
   }
 
   async findEventByPrivateProperties(input: {
