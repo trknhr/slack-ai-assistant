@@ -64,6 +64,7 @@ export interface AgentRunResult {
   sessionId?: string;
   status: "completed";
   taskIds: string[];
+  recurringTaskIds: string[];
   savedMemoryIds: string[];
   calendarDraftIds: string[];
 }

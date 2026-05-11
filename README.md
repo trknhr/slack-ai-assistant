@@ -10,7 +10,7 @@ This repository provides the application glue around AgentCore Runtime:
 - session mapping and event deduplication
 - attachment handling for PDFs, images, and text files
 - raw Slack attachment archival to private S3 storage
-- custom tool execution in AgentCore Runtime backed by DynamoDB for memories, tasks, and calendar drafts
+- custom tool execution in AgentCore Runtime backed by DynamoDB for memories, tasks, recurring tasks, and calendar drafts
 
 The goal is to keep reasoning, tool loops, and runtime isolation inside AgentCore while handling webhooks, queues, and app-facing integrations in AWS.
 
@@ -54,23 +54,33 @@ Raw attachment archive
 - `document-import-api` Lambda
 - `document-import-worker` Lambda
 - `scheduled-agent-runner` Lambda
+- `chat-api` Lambda
+- `slack-interactions` Lambda
+- `google-oauth` Lambda
 - API Gateway
 - SQS + DLQ
-- 9 DynamoDB tables
+- 13 DynamoDB tables
 - private S3 bucket for supported Slack attachments
 - EventBridge Scheduler
 - AgentCore Runtime container for model and tool-loop execution
-- custom tool execution for memory, task, and calendar draft persistence
+- custom tool execution for memory, task, recurring task, and calendar draft persistence
 - local bulk import for `pdf`, `jpg/jpeg`, and `png`
+- local Markdown ingestion for notes, task lists, and recurring task definitions
 
 ## DynamoDB tables
 
 - `SlackThreadSessionsTable`
-  Maps Slack `workspace/channel/thread` to AgentCore runtime session IDs
+  Stores reusable runtime session IDs for scheduled tasks that opt into session reuse
+- `ConversationSessionsTable`
+  Maps Slack `workspace/channel/conversation` to AgentCore runtime session IDs
+- `ConversationTurnsTable`
+  Stores Slack conversation turns for thread and top-level channel context
 - `ProcessedEventsTable`
   Stores Slack event IDs for deduplication
 - `ScheduledTasksTable`
-  Stores scheduled task definitions
+  Stores scheduled Agent run definitions such as `daily-summary`
+- `RecurringTasksTable`
+  Stores recurring task definitions that are materialized into task instances by the scheduled runner
 - `UserMemoriesTable`
   Legacy table retained to avoid destructive stack changes
 - `MemoryItemsTable`
@@ -83,6 +93,8 @@ Raw attachment archive
   Stores reviewable Google Calendar event drafts before they are applied
 - `SourceDocumentsTable`
   Stores archived Slack attachment metadata and archive status
+- `GoogleOAuthConnectionsTable`
+  Stores per-user Google Calendar OAuth connections
 
 ## Repository layout
 
@@ -90,6 +102,8 @@ Raw attachment archive
 bin/
 lib/
 agentcore/
+app/
+  SlackAgent/
 scripts/
 src/
   agentcore/
@@ -148,14 +162,24 @@ Notes:
 
 The `SlackAgent` runtime is defined in `agentcore/agentcore.json` and implemented by `src/agentcore/runtime.ts`.
 
+The container build context lives under `app/SlackAgent/`. That directory points back to the root TypeScript source and package metadata so the Lambda code and AgentCore runtime share the same domain logic and tool definitions.
+
 The CDK stack creates the AgentCore runtime, grants the Lambda functions invoke permission, and grants the runtime access to the DynamoDB tables and Google Calendar secret needed by the tools.
 
-## Google Calendar draft flow
+Tool groups available inside AgentCore:
 
-The MVP integrates Google Calendar as custom tools inside the AgentCore runtime.
+- durable memory: `search_memories`, `save_memory`
+- one-off tasks: `list_tasks`, `upsert_task`, `mark_task_done`
+- recurring tasks: `list_recurring_tasks`, `upsert_recurring_task`, `disable_recurring_task`
+- Google Calendar drafts: `list_calendar_events`, `find_free_busy`, `create_calendar_draft`, `list_calendar_drafts`, `apply_calendar_draft`, `discard_calendar_draft`
+
+## Google Calendar Draft Flow
+
+The app integrates Google Calendar as custom tools inside the AgentCore runtime.
 
 Available tools:
 
+- `list_google_calendars`
 - `list_calendar_events`
 - `find_free_busy`
 - `create_calendar_draft`
@@ -211,7 +235,7 @@ Flow:
 1. The script requests a presigned upload URL from `/imports/uploads`.
 2. It uploads the original file to private S3.
 3. It queues processing through `/imports/documents`.
-4. The import worker sends the file to AgentCore Runtime, which persists tasks and memories through the existing custom tools.
+4. The import worker sends the file to AgentCore Runtime, which persists memories, one-off tasks, recurring tasks, and calendar drafts through custom tools.
 5. The script can poll `/imports/workspaces/{workspaceId}/sources/{sourceId}` until completion.
 
 Security:
@@ -257,7 +281,7 @@ Security:
 
 ## Markdown ingestion
 
-Markdown ingestion uses the same `SourceDocumentsTable`, private S3 archive bucket, and import worker.
+Markdown ingestion uses the same `SourceDocumentsTable`, private S3 archive bucket, and import worker. Repeating rules such as weekly or monthly duties should be captured as recurring task definitions, not as one-off task instances.
 
 Supported formats:
 
@@ -287,7 +311,7 @@ Flow:
 1. The script reads local markdown files and posts them to `/imports/markdown`.
 2. The API stores the original markdown in private S3 under `raw/private/notes/...`.
 3. It queues processing through the existing document import worker.
-4. The worker sends the note to AgentCore Runtime, which persists tasks and memories through the existing custom tools.
+4. The worker sends the note to AgentCore Runtime, which persists memories, one-off tasks, recurring tasks, and calendar drafts through custom tools.
 5. The script can poll `/imports/workspaces/{workspaceId}/sources/{sourceId}` until completion.
 
 Security:
@@ -319,6 +343,7 @@ The response includes:
 - the assistant text response
 - any saved memory IDs
 - any task IDs touched during the answer
+- any recurring task IDs touched during the answer
 
 To continue the same conversation, pass the returned `session_id` back:
 
@@ -341,7 +366,9 @@ Notes:
 ## Current scope
 
 - EventBridge Scheduler triggers `daily-summary`
-- scheduled task definitions live in `ScheduledTasksTable`
+- scheduled Agent run definitions live in `ScheduledTasksTable`
+- recurring task definitions live in `RecurringTasksTable`
+- the scheduled runner materializes enabled recurring tasks for the next 7 days before building the daily reminder
 - fallback scheduled tasks can be created from `outputChannelId` in the invoke payload or from `defaultScheduleChannel`
 
 Example scheduled task item:
@@ -358,6 +385,31 @@ Example scheduled task item:
   "reuseSession": false,
   "createdAt": "2026-04-13T00:00:00.000Z",
   "updatedAt": "2026-04-13T00:00:00.000Z"
+}
+```
+
+Example recurring task item:
+
+```json
+{
+  "pk": "WORKSPACE#T0123456789",
+  "sk": "RECURRING_TASK#rt_cfc324a11246c10f",
+  "recurringTaskId": "rt_cfc324a11246c10f",
+  "workspaceId": "T0123456789",
+  "title": "Submit weekly report",
+  "recurrence": {
+    "frequency": "weekly",
+    "interval": 1,
+    "daysOfWeek": ["friday"]
+  },
+  "dueTime": "17:00",
+  "timezone": "Asia/Tokyo",
+  "enabled": true,
+  "ownerUserId": "U0123456789",
+  "priority": "medium",
+  "sourceType": "agent",
+  "createdAt": "2026-05-11T00:00:00.000Z",
+  "updatedAt": "2026-05-11T00:00:00.000Z"
 }
 ```
 

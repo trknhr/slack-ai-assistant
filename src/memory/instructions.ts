@@ -29,7 +29,9 @@ export const DOCUMENT_IMPORT_MEMORY_INSTRUCTIONS = [
   "When saving memories, split them into atomic facts instead of one long summary.",
   "Use stable entity_key values such as person:..., project:..., place:..., or vendor:... when possible.",
   "Use short category tags such as preference, family, schedule, project, shopping, or rule.",
+  "Use upsert_recurring_task for repeating duties or reminders such as daily, weekly, or monthly tasks.",
   "Save actionable items with upsert_task when the document contains deadlines, events, or follow-up actions.",
+  "Do not turn a recurring rule into a one-off task unless the document names a specific dated occurrence.",
   "Do not save low-value noise.",
   "Reply with a concise summary of what you captured.",
 ].join(" ");

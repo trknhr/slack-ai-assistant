@@ -49,6 +49,7 @@ export class AgentCoreRuntimeClient {
       sessionId: response.runtimeSessionId ?? input.sessionId,
       status: "completed",
       taskIds: parsed.taskIds,
+      recurringTaskIds: parsed.recurringTaskIds,
       savedMemoryIds: parsed.savedMemoryIds,
       calendarDraftIds: parsed.calendarDraftIds,
     };
@@ -76,6 +77,7 @@ function parseRuntimeResponse(raw: string) {
     return agentRuntimeResponseSchema.parse({
       text: text.trim() || "(No text response returned)",
       taskIds: Array.isArray(metadata?.taskIds) ? metadata.taskIds : [],
+      recurringTaskIds: Array.isArray(metadata?.recurringTaskIds) ? metadata.recurringTaskIds : [],
       savedMemoryIds: Array.isArray(metadata?.savedMemoryIds) ? metadata.savedMemoryIds : [],
       calendarDraftIds: Array.isArray(metadata?.calendarDraftIds) ? metadata.calendarDraftIds : [],
     });

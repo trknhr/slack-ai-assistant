@@ -135,6 +135,13 @@ export class SlackAiAssistantStack extends Stack {
       pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
     });
 
+    const recurringTasksTable = new dynamodb.Table(this, "RecurringTasksTable", {
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+    });
+
     const sourceDocumentsTable = new dynamodb.Table(this, "SourceDocumentsTable", {
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
@@ -197,6 +204,7 @@ export class SlackAiAssistantStack extends Stack {
       MEMORY_ITEMS_TABLE_NAME: memoryItemsTable.tableName,
       TASKS_TABLE_NAME: tasksTable.tableName,
       TASK_EVENTS_TABLE_NAME: taskEventsTable.tableName,
+      RECURRING_TASKS_TABLE_NAME: recurringTasksTable.tableName,
       PROCESSED_EVENTS_TABLE_NAME: processedEventsTable.tableName,
       TASK_TABLE_NAME: scheduledTasksTable.tableName,
       SLACK_SIGNING_SECRET_SECRET_ID: slackSigningSecretName,
@@ -355,6 +363,7 @@ export class SlackAiAssistantStack extends Stack {
     taskEventsTable.grantReadWriteData(slackInteractions);
     processedEventsTable.grantReadWriteData(ingress);
     scheduledTasksTable.grantReadWriteData(scheduledRunner);
+    recurringTasksTable.grantReadWriteData(scheduledRunner);
     userMemoryTable.grantReadWriteData(chatApi);
     memoryItemsTable.grantReadWriteData(slackInteractions);
     attachmentArchiveBucket.grantPut(worker, "raw/private/slack/*");
@@ -399,6 +408,7 @@ export class SlackAiAssistantStack extends Stack {
     memoryItemsTable.grantReadWriteData(slackAgentRuntime.role);
     tasksTable.grantReadWriteData(slackAgentRuntime.role);
     taskEventsTable.grantReadWriteData(slackAgentRuntime.role);
+    recurringTasksTable.grantReadWriteData(slackAgentRuntime.role);
     calendarDraftsTable.grantReadWriteData(slackAgentRuntime.role);
     googleOAuthConnectionsTable.grantReadWriteData(slackAgentRuntime.role);
     slackAgentRuntime.addToPolicy(
@@ -547,6 +557,9 @@ export class SlackAiAssistantStack extends Stack {
     });
     new cdk.CfnOutput(this, "ScheduledTasksTableName", {
       value: scheduledTasksTable.tableName,
+    });
+    new cdk.CfnOutput(this, "RecurringTasksTableName", {
+      value: recurringTasksTable.tableName,
     });
     new cdk.CfnOutput(this, "MemoryItemsTableName", {
       value: memoryItemsTable.tableName,

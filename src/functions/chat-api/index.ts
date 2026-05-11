@@ -62,6 +62,7 @@ async function postMessage(
     sessionId: completion.sessionId,
     text: completion.text,
     taskIds: completion.taskIds,
+    recurringTaskIds: completion.recurringTaskIds,
     savedMemoryIds: completion.savedMemoryIds,
   });
 }

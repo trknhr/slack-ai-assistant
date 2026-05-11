@@ -12,6 +12,7 @@ export const chatMessageResponseSchema = z.object({
   sessionId: z.string().min(1),
   text: z.string(),
   taskIds: z.array(z.string()).default([]),
+  recurringTaskIds: z.array(z.string()).default([]),
   savedMemoryIds: z.array(z.string()).default([]),
 });
 

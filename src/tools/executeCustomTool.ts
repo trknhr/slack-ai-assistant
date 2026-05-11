@@ -10,10 +10,12 @@ import { AgentToolUseEvent, ToolExecutionResult } from "../agent/types";
 import { CalendarDraftRepository } from "../repo/calendarDraftRepository";
 import { ChannelMemoryRepository } from "../repo/channelMemoryRepository";
 import { MemoryItemRepository } from "../repo/memoryItemRepository";
+import { RecurringTaskRepository } from "../repo/recurringTaskRepository";
 import { TaskEventRepository } from "../repo/taskEventRepository";
 import { TaskStateRepository } from "../repo/taskStateRepository";
 import { UserPreferenceRepository } from "../repo/userPreferenceRepository";
 import { Logger } from "../shared/logger";
+import { RecurringTaskRecurrence, recurringTaskWeekdaySchema } from "../tasks/recurringTask";
 import { TaskStatus } from "../tasks/taskState";
 
 const searchMemoriesSchema = z.object({
@@ -56,6 +58,38 @@ const upsertTaskSchema = z.object({
 const markTaskDoneSchema = z.object({
   task_id: z.string().min(1),
   completed_at: z.string().optional(),
+});
+
+const recurringTaskRecurrenceInputSchema = z.object({
+  frequency: z.enum(["daily", "weekly", "monthly"]),
+  interval: z.number().int().min(1).max(12).optional(),
+  days_of_week: z.array(recurringTaskWeekdaySchema).optional(),
+  days_of_month: z.array(z.number().int().min(1).max(31)).optional(),
+  week_of_month: z.union([z.number().int().min(1).max(5), z.literal("last")]).optional(),
+});
+
+const listRecurringTasksSchema = z.object({
+  enabled: z.boolean().optional(),
+  limit: z.number().int().min(1).max(100).optional(),
+});
+
+const upsertRecurringTaskSchema = z.object({
+  recurring_task_id: z.string().min(1).optional(),
+  title: z.string().min(1),
+  description: z.string().optional(),
+  recurrence: recurringTaskRecurrenceInputSchema,
+  due_time: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+  timezone: z.string().min(1).optional(),
+  enabled: z.boolean().optional(),
+  owner_user_id: z.string().min(1).optional(),
+  priority: z.enum(["low", "medium", "high"]).optional(),
+  source_type: z.string().optional(),
+  source_ref: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+});
+
+const disableRecurringTaskSchema = z.object({
+  recurring_task_id: z.string().min(1),
 });
 
 const listCalendarEventsSchema = z.object({
@@ -192,6 +226,7 @@ const discardCalendarDraftSchema = z.object({
 });
 
 type CalendarDraftCandidateInput = z.infer<typeof calendarDraftCandidateSchema>;
+type RecurringTaskRecurrenceInput = z.infer<typeof recurringTaskRecurrenceInputSchema>;
 
 const DEFAULT_CALENDAR_TIME_ZONE = "Asia/Tokyo";
 const CALENDAR_PRIVATE_PROPERTY_KEYS = {
@@ -227,6 +262,7 @@ interface ToolRepositories {
   userPreferences?: UserPreferenceRepository;
   tasks: TaskStateRepository;
   taskEvents: TaskEventRepository;
+  recurringTasks?: RecurringTaskRepository;
   calendarDrafts?: CalendarDraftRepository;
 }
 
@@ -239,12 +275,14 @@ interface ToolIntegrations {
 export interface ToolExecutionSummary {
   savedMemoryIds: string[];
   taskIds: string[];
+  recurringTaskIds: string[];
   calendarDraftIds: string[];
 }
 
 export class CustomToolExecutor {
   private readonly savedMemoryIds = new Set<string>();
   private readonly taskIds = new Set<string>();
+  private readonly recurringTaskIds = new Set<string>();
   private readonly calendarDraftIds = new Set<string>();
 
   constructor(
@@ -277,6 +315,12 @@ export class CustomToolExecutor {
           return await this.upsertTask(input);
         case "mark_task_done":
           return await this.markTaskDone(input);
+        case "list_recurring_tasks":
+          return await this.listRecurringTasks(input);
+        case "upsert_recurring_task":
+          return await this.upsertRecurringTask(input);
+        case "disable_recurring_task":
+          return await this.disableRecurringTask(input);
         case "list_google_calendars":
           return await this.listGoogleCalendars(input);
         case "list_calendar_events":
@@ -314,6 +358,7 @@ export class CustomToolExecutor {
     return {
       savedMemoryIds: [...this.savedMemoryIds],
       taskIds: [...this.taskIds],
+      recurringTaskIds: [...this.recurringTaskIds],
       calendarDraftIds: [...this.calendarDraftIds],
     };
   }
@@ -601,6 +646,84 @@ export class CustomToolExecutor {
       task_id: task.taskId,
       status: task.status,
       completed_at: task.completedAt,
+    });
+  }
+
+  private async listRecurringTasks(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = listRecurringTasksSchema.parse(input);
+    const repository = this.requireRecurringTaskRepository();
+    const tasks = await repository.list({
+      workspaceId: this.context.workspaceId,
+      enabled: parsed.enabled,
+      limit: parsed.limit,
+    });
+
+    return jsonResult({
+      count: tasks.length,
+      recurring_tasks: tasks.map((task) => ({
+        recurring_task_id: task.recurringTaskId,
+        title: task.title,
+        description: task.description,
+        recurrence: serializeRecurringTaskRecurrence(task.recurrence),
+        due_time: task.dueTime,
+        timezone: task.timezone,
+        enabled: task.enabled,
+        owner_user_id: task.ownerUserId,
+        priority: task.priority,
+        source_type: task.sourceType,
+        source_ref: task.sourceRef,
+        updated_at: task.updatedAt,
+      })),
+    });
+  }
+
+  private async upsertRecurringTask(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = upsertRecurringTaskSchema.parse(input);
+    const repository = this.requireRecurringTaskRepository();
+    const recurrence = normalizeRecurringTaskRecurrence(parsed.recurrence);
+    const recurringTaskId =
+      normalizeOptionalString(parsed.recurring_task_id) ??
+      buildRecurringTaskId(parsed.title, recurrence, parsed.due_time);
+    const task = await repository.upsert({
+      recurringTaskId,
+      workspaceId: this.context.workspaceId,
+      title: parsed.title,
+      description: parsed.description,
+      recurrence,
+      dueTime: parsed.due_time ?? "23:59",
+      timezone: parsed.timezone ?? this.getDefaultCalendarTimeZone(),
+      enabled: parsed.enabled,
+      ownerUserId: parsed.owner_user_id ?? this.context.userId,
+      priority: parsed.priority,
+      sourceType: parsed.source_type ?? "agent",
+      sourceRef: parsed.source_ref,
+      metadata: parsed.metadata,
+    });
+    this.recurringTaskIds.add(task.recurringTaskId);
+
+    return jsonResult({
+      saved: true,
+      recurring_task_id: task.recurringTaskId,
+      title: task.title,
+      recurrence: serializeRecurringTaskRecurrence(task.recurrence),
+      due_time: task.dueTime,
+      timezone: task.timezone,
+      enabled: task.enabled,
+      updated_at: task.updatedAt,
+    });
+  }
+
+  private async disableRecurringTask(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = disableRecurringTaskSchema.parse(input);
+    const repository = this.requireRecurringTaskRepository();
+    const task = await repository.disable(this.context.workspaceId, parsed.recurring_task_id);
+    this.recurringTaskIds.add(task.recurringTaskId);
+
+    return jsonResult({
+      disabled: true,
+      recurring_task_id: task.recurringTaskId,
+      title: task.title,
+      updated_at: task.updatedAt,
     });
   }
 
@@ -956,6 +1079,13 @@ export class CustomToolExecutor {
     return this.repositories.calendarDrafts;
   }
 
+  private requireRecurringTaskRepository(): RecurringTaskRepository {
+    if (!this.repositories.recurringTasks) {
+      throw new Error("Recurring task storage is not configured");
+    }
+    return this.repositories.recurringTasks;
+  }
+
   private getDefaultCalendarTimeZone(): string {
     return this.integrations.defaultCalendarTimeZone ?? DEFAULT_CALENDAR_TIME_ZONE;
   }
@@ -1309,6 +1439,46 @@ function serializeGoogleEventTime(
 function normalizeOptionalString(value?: string): string | undefined {
   const normalized = value?.trim();
   return normalized ? normalized : undefined;
+}
+
+function normalizeRecurringTaskRecurrence(
+  input: RecurringTaskRecurrenceInput,
+): RecurringTaskRecurrence {
+  return {
+    frequency: input.frequency,
+    interval: input.interval ?? 1,
+    daysOfWeek: input.days_of_week && input.days_of_week.length > 0 ? [...new Set(input.days_of_week)] : undefined,
+    daysOfMonth: input.days_of_month && input.days_of_month.length > 0 ? [...new Set(input.days_of_month)] : undefined,
+    weekOfMonth: input.week_of_month,
+  };
+}
+
+function serializeRecurringTaskRecurrence(
+  recurrence: RecurringTaskRecurrence,
+): Record<string, unknown> {
+  return {
+    frequency: recurrence.frequency,
+    interval: recurrence.interval,
+    days_of_week: recurrence.daysOfWeek,
+    days_of_month: recurrence.daysOfMonth,
+    week_of_month: recurrence.weekOfMonth,
+  };
+}
+
+function buildRecurringTaskId(
+  title: string,
+  recurrence: RecurringTaskRecurrence,
+  dueTime?: string,
+): string {
+  const hash = createHash("sha256")
+    .update(JSON.stringify({
+      title: title.trim().toLowerCase(),
+      recurrence,
+      dueTime: dueTime ?? "23:59",
+    }))
+    .digest("hex")
+    .slice(0, 16);
+  return `rt_${hash}`;
 }
 
 function isDateOnly(value: string): boolean {

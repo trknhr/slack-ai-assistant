@@ -36,6 +36,7 @@ interface SourceStatusResponse {
   summary?: string;
   errorMessage?: string;
   importedTaskIds?: string[];
+  importedRecurringTaskIds?: string[];
   savedMemoryIds?: string[];
 }
 
@@ -89,6 +90,7 @@ async function importSingleFile(options: CliOptions, filePath: string): Promise<
 
   const status = await waitForTerminalStatus(options, upload.statusUrl);
   const taskCount = status.importedTaskIds?.length ?? 0;
+  const recurringTaskCount = status.importedRecurringTaskIds?.length ?? 0;
   const memoryCount = status.savedMemoryIds?.length ?? 0;
   console.log(`[${status.status}] ${sourcePath}`);
   if (status.summary) {
@@ -97,7 +99,7 @@ async function importSingleFile(options: CliOptions, filePath: string): Promise<
   if (status.errorMessage) {
     console.log(`Error: ${status.errorMessage}`);
   }
-  console.log(`Tasks: ${taskCount}, Memories: ${memoryCount}`);
+  console.log(`Tasks: ${taskCount}, Recurring tasks: ${recurringTaskCount}, Memories: ${memoryCount}`);
 }
 
 async function collectInputFiles(inputs: string[]): Promise<string[]> {

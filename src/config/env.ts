@@ -10,6 +10,7 @@ const baseEnvSchema = z.object({
   MEMORY_ITEMS_TABLE_NAME: requiredString,
   TASKS_TABLE_NAME: requiredString,
   TASK_EVENTS_TABLE_NAME: requiredString,
+  RECURRING_TASKS_TABLE_NAME: requiredString,
   PROCESSED_EVENTS_TABLE_NAME: requiredString,
   TASK_TABLE_NAME: requiredString,
   SLACK_SIGNING_SECRET_SECRET_ID: requiredString,

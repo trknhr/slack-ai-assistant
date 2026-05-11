@@ -56,6 +56,7 @@ export const agentRuntimeResourcesSchema = z.object({
   memoryItemsTableName: z.string().min(1),
   tasksTableName: z.string().min(1),
   taskEventsTableName: z.string().min(1),
+  recurringTasksTableName: z.string().min(1),
   calendarDraftsTableName: z.string().min(1),
   googleOAuthConnectionsTableName: z.string().min(1),
   googleCalendarSecretId: z.string().min(1),
@@ -97,6 +98,7 @@ export const agentRuntimeRequestSchema = z.object({
 export const agentRuntimeResponseSchema = z.object({
   text: z.string(),
   taskIds: z.array(z.string()).default([]),
+  recurringTaskIds: z.array(z.string()).default([]),
   savedMemoryIds: z.array(z.string()).default([]),
   calendarDraftIds: z.array(z.string()).default([]),
 });
@@ -110,6 +112,7 @@ export interface ToolRuntimeEnvironment {
   MEMORY_ITEMS_TABLE_NAME: string;
   TASKS_TABLE_NAME: string;
   TASK_EVENTS_TABLE_NAME: string;
+  RECURRING_TASKS_TABLE_NAME: string;
   CALENDAR_DRAFTS_TABLE_NAME: string;
   GOOGLE_OAUTH_CONNECTIONS_TABLE_NAME: string;
   GOOGLE_CALENDAR_SECRET_ID: string;
@@ -122,6 +125,7 @@ export function buildAgentRuntimeResources(env: ToolRuntimeEnvironment): AgentRu
     memoryItemsTableName: env.MEMORY_ITEMS_TABLE_NAME,
     tasksTableName: env.TASKS_TABLE_NAME,
     taskEventsTableName: env.TASK_EVENTS_TABLE_NAME,
+    recurringTasksTableName: env.RECURRING_TASKS_TABLE_NAME,
     calendarDraftsTableName: env.CALENDAR_DRAFTS_TABLE_NAME,
     googleOAuthConnectionsTableName: env.GOOGLE_OAUTH_CONNECTIONS_TABLE_NAME,
     googleCalendarSecretId: env.GOOGLE_CALENDAR_SECRET_ID,

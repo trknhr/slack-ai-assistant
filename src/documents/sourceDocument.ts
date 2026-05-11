@@ -35,6 +35,7 @@ export interface SourceDocument {
   status: SourceDocumentStatus;
   summary?: string;
   importedTaskIds?: string[];
+  importedRecurringTaskIds?: string[];
   savedMemoryIds?: string[];
   errorMessage?: string;
   extractionStatus?: SourceExtractionStatus;

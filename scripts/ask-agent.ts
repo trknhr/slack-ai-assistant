@@ -27,6 +27,9 @@ async function main(): Promise<void> {
   if (response.taskIds.length > 0) {
     console.log(`task_ids: ${response.taskIds.join(", ")}`);
   }
+  if (response.recurringTaskIds.length > 0) {
+    console.log(`recurring_task_ids: ${response.recurringTaskIds.join(", ")}`);
+  }
   console.log("");
   console.log(response.text);
 }

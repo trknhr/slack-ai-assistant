@@ -120,6 +120,76 @@ export const customToolDefinitions = [
     },
   },
   {
+    name: "list_recurring_tasks",
+    description:
+      "List recurring task definitions such as weekly chores, monthly reports, or repeating reminders. These are recurrence rules, not one-off task instances.",
+    input_schema: {
+      type: "object",
+      properties: {
+        enabled: { type: "boolean" },
+        limit: { type: "integer", minimum: 1, maximum: 100 },
+      },
+    },
+  },
+  {
+    name: "upsert_recurring_task",
+    description:
+      "Create or update a recurring task definition. Use this for tasks that repeat daily, weekly, or monthly; do not create one-off tasks for recurring rules unless the user asks for a specific occurrence.",
+    input_schema: {
+      type: "object",
+      properties: {
+        recurring_task_id: { type: "string" },
+        title: { type: "string" },
+        description: { type: "string" },
+        recurrence: {
+          type: "object",
+          properties: {
+            frequency: { type: "string", enum: ["daily", "weekly", "monthly"] },
+            interval: { type: "integer", minimum: 1, maximum: 12 },
+            days_of_week: {
+              type: "array",
+              items: {
+                type: "string",
+                enum: ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+              },
+            },
+            days_of_month: {
+              type: "array",
+              items: { type: "integer", minimum: 1, maximum: 31 },
+            },
+            week_of_month: {
+              anyOf: [
+                { type: "integer", minimum: 1, maximum: 5 },
+                { type: "string", enum: ["last"] },
+              ],
+            },
+          },
+          required: ["frequency"],
+        },
+        due_time: { type: "string", description: "Local due time in HH:mm, for example 21:00 or 23:59." },
+        timezone: { type: "string", description: "IANA time zone such as Asia/Tokyo." },
+        enabled: { type: "boolean" },
+        owner_user_id: { type: "string" },
+        priority: { type: "string", enum: ["low", "medium", "high"] },
+        source_type: { type: "string" },
+        source_ref: { type: "string" },
+        metadata: { type: "object" },
+      },
+      required: ["title", "recurrence"],
+    },
+  },
+  {
+    name: "disable_recurring_task",
+    description: "Disable a recurring task definition so future occurrences are no longer generated.",
+    input_schema: {
+      type: "object",
+      properties: {
+        recurring_task_id: { type: "string" },
+      },
+      required: ["recurring_task_id"],
+    },
+  },
+  {
     name: "list_google_calendars",
     description:
       "List Google calendars available to the connected user, including access roles. Use this before targeting a named non-primary calendar such as Family.",

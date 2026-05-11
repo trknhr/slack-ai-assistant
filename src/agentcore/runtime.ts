@@ -11,6 +11,7 @@ import { CalendarDraftRepository } from "../repo/calendarDraftRepository";
 import { ChannelMemoryRepository } from "../repo/channelMemoryRepository";
 import { GoogleOAuthConnectionRepository } from "../repo/googleOAuthConnectionRepository";
 import { MemoryItemRepository } from "../repo/memoryItemRepository";
+import { RecurringTaskRepository } from "../repo/recurringTaskRepository";
 import { TaskEventRepository } from "../repo/taskEventRepository";
 import { TaskStateRepository } from "../repo/taskStateRepository";
 import { UserPreferenceRepository } from "../repo/userPreferenceRepository";
@@ -31,7 +32,8 @@ const maxSessionHistoryMessages = 20;
 const defaultSystemPrompt = [
   "You are a Slack AI assistant running on Amazon Bedrock AgentCore.",
   "Answer in the user's language unless the user asks otherwise.",
-  "Use tools for durable memory, tasks, and calendar operations when they are relevant.",
+  "Use tools for durable memory, one-off tasks, recurring task definitions, and calendar operations when they are relevant.",
+  "Use recurring task tools for daily, weekly, monthly, or otherwise repeated duties instead of creating a one-off task for the rule.",
   "For Google Calendar writes, create a reviewable calendar draft first unless the request is an explicit approval of an existing draft.",
   "Keep Slack replies concise and actionable.",
 ].join("\n");
@@ -109,6 +111,7 @@ async function main(): Promise<void> {
 
         const summary = executor?.getSummary() ?? {
           taskIds: [],
+          recurringTaskIds: [],
           savedMemoryIds: [],
           calendarDraftIds: [],
         };
@@ -116,6 +119,7 @@ async function main(): Promise<void> {
         yield { event: "metadata", data: summary };
         log.info("AgentCore request completed", {
           taskIds: summary.taskIds,
+          recurringTaskIds: summary.recurringTaskIds,
           savedMemoryIds: summary.savedMemoryIds,
           calendarDraftIds: summary.calendarDraftIds,
         });
@@ -142,6 +146,7 @@ function createToolExecutor(
       userPreferences: new UserPreferenceRepository(resources.memoryItemsTableName),
       tasks: new TaskStateRepository(resources.tasksTableName),
       taskEvents: new TaskEventRepository(resources.taskEventsTableName),
+      recurringTasks: new RecurringTaskRepository(resources.recurringTasksTableName),
       calendarDrafts: new CalendarDraftRepository(resources.calendarDraftsTableName),
     },
     {

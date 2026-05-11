@@ -13,7 +13,7 @@ import { logger } from "../../shared/logger";
 import { defaultExtensionForMimeType } from "../../slack/fileSupport";
 
 const DEFAULT_IMPORT_PROMPT = [
-  "Analyze the uploaded household document.",
+  "Analyze the uploaded document.",
   DOCUMENT_IMPORT_MEMORY_INSTRUCTIONS,
 ].join(" ");
 
@@ -145,6 +145,7 @@ async function importDocument(
     status: "imported",
     summary: completion.text,
     importedTaskIds: completion.taskIds,
+    importedRecurringTaskIds: completion.recurringTaskIds,
     savedMemoryIds: completion.savedMemoryIds,
     errorMessage: undefined,
     updatedAt: new Date().toISOString(),
@@ -153,6 +154,7 @@ async function importDocument(
   log.info("Document imported", {
     sessionId: completion.sessionId,
     taskCount: completion.taskIds.length,
+    recurringTaskCount: completion.recurringTaskIds.length,
     memoryCount: completion.savedMemoryIds.length,
   });
 }
