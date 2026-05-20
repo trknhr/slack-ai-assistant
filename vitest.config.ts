@@ -17,6 +17,7 @@ export default defineConfig({
         "src/conversations/**/*.ts",
         "src/documents/contentBlocks.ts",
         "src/imports/contracts.ts",
+        "src/line/**/*.ts",
         "src/repo/**/*.ts",
         "src/shared/**/*.ts",
         "src/slack/**/*.ts",

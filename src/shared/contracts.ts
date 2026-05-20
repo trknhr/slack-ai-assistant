@@ -36,6 +36,26 @@ export type SlackQueueMessage = z.infer<typeof slackQueueMessageSchema>;
 
 export type SlackFileReference = SlackQueueMessage["files"][number];
 
+export const lineQueueMessageSchema = z.object({
+  correlationId: z.string().min(1),
+  eventId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  providerAccountId: z.string().min(1),
+  channelId: z.string().min(1),
+  conversationTs: z.string().min(1),
+  messageTs: z.string().min(1),
+  userId: z.string().min(1),
+  text: z.string().min(1),
+  replyToken: z.string().min(1).optional(),
+  responseTargetId: z.string().min(1),
+  responseTargetType: z.enum(["user", "group", "room"]),
+  source: z.literal("message"),
+  contextScope: z.literal("channel_top_level"),
+  receivedAt: z.string().min(1),
+});
+
+export type LineQueueMessage = z.infer<typeof lineQueueMessageSchema>;
+
 export interface ConversationSessionRecord {
   workspaceId: string;
   channelId: string;
@@ -53,8 +73,15 @@ export interface ConversationTurnRecord {
   conversationTs: string;
   contextScope: "channel_top_level" | "thread";
   role: "user" | "assistant" | "tool" | "system";
-  source: "slack";
-  sourceEvent: "app_mention" | "dm" | "thread_reply" | "assistant_reply" | "thread_backfill";
+  source: "slack" | "line";
+  sourceEvent:
+    | "app_mention"
+    | "dm"
+    | "thread_reply"
+    | "assistant_reply"
+    | "thread_backfill"
+    | "line_message"
+    | "line_assistant_reply";
   threadTs?: string;
   messageTs: string;
   turnTs: string;

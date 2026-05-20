@@ -1,22 +1,28 @@
 import type { SQSEvent } from "aws-lambda";
+import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { AgentRunResult } from "../../agent/types";
 import { AgentCoreRuntimeClient } from "../../agentcore/client";
 import { buildAgentRuntimeResources } from "../../agentcore/contracts";
 import { SecretsProvider } from "../../aws/secretsProvider";
 import { CalendarDraft } from "../../calendar/calendarDraft";
 import { buildSlackContextBlocks, buildTurnText } from "../../conversations/buildSlackContextBlocks";
 import { loadWorkerEnv } from "../../config/env";
+import { SourceDocument } from "../../documents/sourceDocument";
 import { CalendarDraftRepository } from "../../repo/calendarDraftRepository";
 import { ConversationSessionRepository } from "../../repo/conversationSessionRepository";
 import { ConversationTurnRepository } from "../../repo/conversationTurnRepository";
 import { SourceDocumentRepository } from "../../repo/sourceDocumentRepository";
 import { ConversationSessionRecord, ConversationTurnRecord, slackQueueMessageSchema } from "../../shared/contracts";
 import { logger } from "../../shared/logger";
+import { stripModelThinking } from "../../shared/text";
 import { SlackConversationsClient, SlackThreadMessage } from "../../slack/conversationsClient";
 import { SlackFilesClient } from "../../slack/filesClient";
 import { SlackAttachmentArchiveService } from "../../slack/slackAttachmentArchiveService";
 import { SlackBlock, SlackWebClient } from "../../slack/postMessage";
 
 const env = loadWorkerEnv();
+const s3Client = new S3Client({});
 const secretsProvider = new SecretsProvider();
 const agentClient = new AgentCoreRuntimeClient({
   runtimeArn: env.AGENTCORE_RUNTIME_ARN,
@@ -82,8 +88,14 @@ export async function handler(event: SQSEvent): Promise<void> {
       }
     }
 
+    const thinkingMessage = await slackClient.postMessage({
+      channel: queueMessage.channelId,
+      threadTs: queueMessage.replyThreadTs,
+      text: "考え中です...",
+    });
+
     const preparedAttachments = await slackFilesClient.prepareAttachments(queueMessage.files);
-    await attachmentArchiveService.archiveAttachments({
+    const archivedDocuments = await attachmentArchiveService.archiveAttachments({
       workspaceId: queueMessage.workspaceId,
       channelId: queueMessage.channelId,
       threadTs: queueMessage.replyThreadTs ?? queueMessage.conversationTs,
@@ -92,7 +104,13 @@ export async function handler(event: SQSEvent): Promise<void> {
       attachments: preparedAttachments,
       logger: log,
     });
-    const attachmentBlocks = slackFilesClient.buildContentBlocks(preparedAttachments);
+    const attachmentBlocks = await slackFilesClient.buildContentBlocksFromArchive(
+      preparedAttachments,
+      archivedDocuments,
+      {
+        presignUrl: presignSourceDocument,
+      },
+    );
 
     const priorTurns =
       queueMessage.contextScope === "thread"
@@ -122,42 +140,26 @@ export async function handler(event: SQSEvent): Promise<void> {
       text: buildTurnText(queueMessage.text, queueMessage.files),
     });
 
-    const thinkingMessage = await slackClient.postMessage({
-      channel: queueMessage.channelId,
-      threadTs: queueMessage.replyThreadTs,
-      text: "考え中です...",
+    const completion = await invokeAgentOrRespondWithError({
+      queueMessage,
+      sessionRecord,
+      thinkingMessageTs: thinkingMessage.ts,
+      content: buildSlackContextBlocks({
+        contextScope: queueMessage.contextScope,
+        priorTurns,
+        currentText: queueMessage.text,
+        attachmentBlocks,
+      }),
+      log,
     });
-
-    const completion = await agentClient.invoke({
-      sessionId: sessionRecord.agentRuntimeSessionId,
-      runtimeUserId: queueMessage.userId,
-      request: {
-        content: buildSlackContextBlocks({
-          contextScope: queueMessage.contextScope,
-          priorTurns,
-          currentText: queueMessage.text,
-          attachmentBlocks,
-        }),
-        context: {
-          source: "slack",
-          workspaceId: queueMessage.workspaceId,
-          userId: queueMessage.userId,
-          channelId: queueMessage.channelId,
-          conversationTs: queueMessage.conversationTs,
-        },
-        resources: buildAgentRuntimeResources(env),
-        toolContext: {
-          workspaceId: queueMessage.workspaceId,
-          userId: queueMessage.userId,
-          channelId: queueMessage.channelId,
-          memoryWritePolicy: {
-            allowWorkspaceMemory: false,
-            channelInferredStatus: "candidate",
-            defaultOrigin: "inferred",
-          },
-        },
-      },
-    });
+    if (!completion) {
+      await conversationSessionRepository.save({
+        ...sessionRecord,
+        lastUsedAt: now,
+      });
+      continue;
+    }
+    const completionText = stripModelThinking(completion.text) || "処理は完了しましたが、返答テキストが空でした。";
 
     if (thinkingMessage.ts) {
       try {
@@ -165,7 +167,7 @@ export async function handler(event: SQSEvent): Promise<void> {
           channel: queueMessage.channelId,
           ts: thinkingMessage.ts,
           threadTs: queueMessage.replyThreadTs,
-          text: completion.text,
+          text: completionText,
         });
       } catch (error) {
         log.warn("Failed to replace Slack thinking message; posting final response separately", {
@@ -174,14 +176,14 @@ export async function handler(event: SQSEvent): Promise<void> {
         await slackClient.postMessage({
           channel: queueMessage.channelId,
           threadTs: queueMessage.replyThreadTs,
-          text: completion.text,
+          text: completionText,
         });
       }
     } else {
       await slackClient.postMessage({
         channel: queueMessage.channelId,
         threadTs: queueMessage.replyThreadTs,
-        text: completion.text,
+        text: completionText,
       });
     }
 
@@ -197,7 +199,7 @@ export async function handler(event: SQSEvent): Promise<void> {
       threadTs: queueMessage.replyThreadTs,
       messageTs: assistantMessageTs,
       turnTs: assistantMessageTs,
-      text: completion.text,
+      text: completionText,
     });
 
     for (const draftId of completion.calendarDraftIds) {
@@ -231,6 +233,126 @@ export async function handler(event: SQSEvent): Promise<void> {
       archivedAttachmentCount: preparedAttachments.filter((attachment) => attachment.status === "ready").length,
     });
   }
+}
+
+async function invokeAgentOrRespondWithError(input: {
+  queueMessage: {
+    workspaceId: string;
+    channelId: string;
+    conversationTs: string;
+    replyThreadTs?: string;
+    userId: string;
+    contextScope: "thread" | "channel_top_level";
+  };
+  sessionRecord: ConversationSessionRecord;
+  thinkingMessageTs?: string;
+  content: ReturnType<typeof buildSlackContextBlocks>;
+  log: ReturnType<typeof logger.child>;
+}): Promise<AgentRunResult | null> {
+  try {
+    return await agentClient.invoke({
+      sessionId: input.sessionRecord.agentRuntimeSessionId,
+      runtimeUserId: input.queueMessage.userId,
+      request: {
+        content: input.content,
+        context: {
+          source: "slack",
+          workspaceId: input.queueMessage.workspaceId,
+          userId: input.queueMessage.userId,
+          channelId: input.queueMessage.channelId,
+          conversationTs: input.queueMessage.conversationTs,
+        },
+        resources: buildAgentRuntimeResources(env),
+        toolContext: {
+          workspaceId: input.queueMessage.workspaceId,
+          userId: input.queueMessage.userId,
+          channelId: input.queueMessage.channelId,
+          memoryWritePolicy: {
+            allowWorkspaceMemory: false,
+            channelInferredStatus: "candidate",
+            defaultOrigin: "inferred",
+          },
+        },
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown AgentCore invocation error";
+    input.log.error("AgentCore invocation failed", { error: message });
+    const responseText = buildAgentInvocationErrorText(message);
+
+    if (input.thinkingMessageTs) {
+      try {
+        await slackClient.updateMessage({
+          channel: input.queueMessage.channelId,
+          ts: input.thinkingMessageTs,
+          threadTs: input.queueMessage.replyThreadTs,
+          text: responseText,
+        });
+      } catch (error) {
+        input.log.warn("Failed to replace Slack thinking message after AgentCore failure", {
+          error: error instanceof Error ? error.message : "Unknown Slack update error",
+        });
+        await slackClient.postMessage({
+          channel: input.queueMessage.channelId,
+          threadTs: input.queueMessage.replyThreadTs,
+          text: responseText,
+        });
+      }
+    } else {
+      await slackClient.postMessage({
+        channel: input.queueMessage.channelId,
+        threadTs: input.queueMessage.replyThreadTs,
+        text: responseText,
+      });
+    }
+
+    const errorMessageTs = input.thinkingMessageTs ?? createSyntheticSlackTs();
+    await conversationTurnRepository.save({
+      workspaceId: input.queueMessage.workspaceId,
+      channelId: input.queueMessage.channelId,
+      conversationTs: input.queueMessage.conversationTs,
+      contextScope: input.queueMessage.contextScope,
+      role: "assistant",
+      source: "slack",
+      sourceEvent: "assistant_reply",
+      threadTs: input.queueMessage.replyThreadTs,
+      messageTs: errorMessageTs,
+      turnTs: errorMessageTs,
+      text: responseText,
+    });
+
+    return null;
+  }
+}
+
+async function presignSourceDocument(document: SourceDocument): Promise<string> {
+  if (!document.s3Bucket || !document.s3Key) {
+    throw new Error("Archived document does not have an S3 location.");
+  }
+
+  return getSignedUrl(
+    s3Client,
+    new GetObjectCommand({
+      Bucket: document.s3Bucket,
+      Key: document.s3Key,
+    }),
+    { expiresIn: 15 * 60 },
+  );
+}
+
+function buildAgentInvocationErrorText(message: string): string {
+  if (message.includes("413") || message.includes("length limit exceeded")) {
+    return [
+      "添付ファイルの内容が大きすぎて処理できませんでした。",
+      "ファイルは保存済みなので、少し小さい画像/PDFで再送するか、必要な箇所を本文で指定してください。",
+    ].join("\n");
+  }
+
+  if (message.includes("use case details have not been submitted")) {
+    return "添付ファイル解析用のBedrockモデルがAWS側でまだ有効化されていません。設定を確認してください。";
+  }
+
+  return "処理中にエラーが発生しました。もう一度試してください。";
 }
 
 function buildCalendarDraftApprovalText(draft: CalendarDraft): string {

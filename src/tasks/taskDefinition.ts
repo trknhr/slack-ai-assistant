@@ -7,6 +7,12 @@ export const scheduledTaskSchema = z.object({
   workspaceId: z.string().min(1),
   outputChannelId: z.string().min(1),
   enabled: z.boolean(),
+  scheduleName: z.string().min(1).optional(),
+  scheduleGroupName: z.string().min(1).optional(),
+  scheduleExpression: z.string().min(1).optional(),
+  scheduleExpressionTimezone: z.string().min(1).optional(),
+  createdByUserId: z.string().min(1).optional(),
+  updatedByUserId: z.string().min(1).optional(),
   reuseSession: z.boolean().default(false),
   memoryStoreId: z.string().optional(),
   vaultIds: z.array(z.string().min(1)).optional(),
@@ -18,6 +24,10 @@ export const scheduledTaskSchema = z.object({
 
 export type ScheduledTask = z.infer<typeof scheduledTaskSchema>;
 
-export function buildScheduledTaskPk(taskId: string): string {
+export function buildScheduledTaskPk(workspaceId: string, taskId: string): string {
+  return `WORKSPACE#${workspaceId}#TASK#${taskId}`;
+}
+
+export function buildLegacyScheduledTaskPk(taskId: string): string {
   return `TASK#${taskId}`;
 }

@@ -23,6 +23,8 @@ import {
   loadImportApiEnv,
   loadImportWorkerEnv,
   loadIngressEnv,
+  loadLineIngressEnv,
+  loadLineWorkerEnv,
   loadSchedulerEnv,
   loadSlackInteractionsEnv,
   loadWorkerEnv,
@@ -43,7 +45,7 @@ import {
   buildScheduledTaskPk,
   scheduledTaskSchema,
 } from "../src/tasks/taskDefinition";
-import { slackQueueMessageSchema } from "../src/shared/contracts";
+import { lineQueueMessageSchema, slackQueueMessageSchema } from "../src/shared/contracts";
 import { Logger, logger } from "../src/shared/logger";
 
 const originalEnv = process.env;
@@ -72,6 +74,7 @@ function baseEnv(overrides: Record<string, string> = {}): Record<string, string>
     TASKS_TABLE_NAME: "tasks",
     TASK_EVENTS_TABLE_NAME: "task-events",
     RECURRING_TASKS_TABLE_NAME: "recurring-tasks",
+    PROVIDER_BINDINGS_TABLE_NAME: "provider-bindings",
     PROCESSED_EVENTS_TABLE_NAME: "processed-events",
     TASK_TABLE_NAME: "scheduled-tasks",
     SLACK_SIGNING_SECRET_SECRET_ID: "slack-signing",
@@ -160,6 +163,7 @@ describe("runtime contract schemas", () => {
     expect(
       buildAgentRuntimeResources({
         MEMORY_ITEMS_TABLE_NAME: "memory",
+        TASK_TABLE_NAME: "scheduled",
         TASKS_TABLE_NAME: "tasks",
         TASK_EVENTS_TABLE_NAME: "events",
         RECURRING_TASKS_TABLE_NAME: "recurring",
@@ -168,9 +172,15 @@ describe("runtime contract schemas", () => {
         GOOGLE_CALENDAR_SECRET_ID: "secret",
         GOOGLE_OAUTH_START_URL: "https://oauth/start",
         GOOGLE_CALENDAR_TIME_ZONE: "Asia/Tokyo",
+        SCHEDULER_SCHEDULE_GROUP_NAME: "default",
+        SCHEDULER_SCHEDULE_NAME_PREFIX: "slack-ai-assistant",
+        SCHEDULER_DEFAULT_TIME_ZONE: "Asia/Tokyo",
+        SCHEDULER_TARGET_ARN: "arn:aws:lambda:target",
+        SCHEDULER_TARGET_ROLE_ARN: "arn:aws:iam::123:role/scheduler",
       }),
     ).toEqual({
       memoryItemsTableName: "memory",
+      scheduledTasksTableName: "scheduled",
       tasksTableName: "tasks",
       taskEventsTableName: "events",
       recurringTasksTableName: "recurring",
@@ -179,6 +189,11 @@ describe("runtime contract schemas", () => {
       googleCalendarSecretId: "secret",
       googleOAuthStartUrl: "https://oauth/start",
       googleCalendarTimeZone: "Asia/Tokyo",
+      schedulerScheduleGroupName: "default",
+      schedulerScheduleNamePrefix: "slack-ai-assistant",
+      schedulerDefaultTimeZone: "Asia/Tokyo",
+      schedulerTargetArn: "arn:aws:lambda:target",
+      schedulerTargetRoleArn: "arn:aws:iam::123:role/scheduler",
     });
   });
 });
@@ -193,7 +208,7 @@ describe("API contract schemas", () => {
         channelId: "C1",
         conversationTs: "100",
         messageTs: "101",
-        userId: "U1",
+        userId: "line:user:U1",
         text: "hello",
         source: "dm",
         contextScope: "channel_top_level",
@@ -201,6 +216,32 @@ describe("API contract schemas", () => {
       }),
     ).toMatchObject({
       files: [],
+    });
+  });
+
+  it("validates LINE queue messages", () => {
+    expect(
+      lineQueueMessageSchema.parse({
+        correlationId: "corr",
+        eventId: "line-event",
+        workspaceId: "line:user:U1",
+        providerAccountId: "Ubot",
+        channelId: "line:user:U1",
+        conversationTs: "line:user:U1",
+        messageTs: "message-1",
+        userId: "U1",
+        text: "hello",
+        replyToken: "reply",
+        responseTargetId: "U1",
+        responseTargetType: "user",
+        source: "message",
+        contextScope: "channel_top_level",
+        receivedAt: "2026-05-18T00:00:00.000Z",
+      }),
+    ).toMatchObject({
+      workspaceId: "line:user:U1",
+      providerAccountId: "Ubot",
+      responseTargetType: "user",
     });
   });
 
@@ -331,7 +372,7 @@ describe("logger", () => {
 
 describe("task schemas", () => {
   it("validates scheduled tasks and builds DynamoDB keys", () => {
-    expect(buildScheduledTaskPk("task-1")).toBe("TASK#task-1");
+    expect(buildScheduledTaskPk("T1", "task-1")).toBe("WORKSPACE#T1#TASK#task-1");
     expect(
       scheduledTaskSchema.parse({
         taskId: "task-1",
@@ -340,10 +381,17 @@ describe("task schemas", () => {
         workspaceId: "T1",
         outputChannelId: "C1",
         enabled: true,
+        scheduleName: "slack-ai-assistant-task-1",
+        scheduleExpression: "cron(0 8 * * ? *)",
+        scheduleExpressionTimezone: "Asia/Tokyo",
         createdAt: "2026-05-14T00:00:00Z",
         updatedAt: "2026-05-14T00:00:00Z",
       }),
-    ).toMatchObject({ reuseSession: false });
+    ).toMatchObject({
+      reuseSession: false,
+      scheduleName: "slack-ai-assistant-task-1",
+      scheduleExpressionTimezone: "Asia/Tokyo",
+    });
   });
 
   it("validates recurring task defaults and bounds", () => {
@@ -382,6 +430,25 @@ describe("environment loaders", () => {
       MAX_SLACK_FILE_BYTES: 10_000_000,
       AGENTCORE_RUNTIME_QUALIFIER: "",
       SLACK_QUEUE_URL: "https://sqs.local/slack",
+    });
+  });
+
+  it("loads LINE ingress and worker env variants", () => {
+    withEnv({
+      ...toolRuntimeEnv(),
+      LINE_CHANNEL_SECRET_SECRET_ID: "line-secret",
+      LINE_CHANNEL_ACCESS_TOKEN_SECRET_ID: "line-token",
+      LINE_QUEUE_URL: "https://sqs.local/line",
+    });
+
+    expect(loadLineIngressEnv()).toMatchObject({
+      LINE_CHANNEL_SECRET_SECRET_ID: "line-secret",
+      LINE_QUEUE_URL: "https://sqs.local/line",
+      TOP_LEVEL_CONTEXT_TURN_LIMIT: 10,
+    });
+    expect(loadLineWorkerEnv()).toMatchObject({
+      LINE_CHANNEL_ACCESS_TOKEN_SECRET_ID: "line-token",
+      CALENDAR_DRAFTS_TABLE_NAME: "calendar-drafts",
     });
   });
 

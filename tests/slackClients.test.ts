@@ -377,6 +377,53 @@ describe("SlackFilesClient", () => {
       ]),
     ).toEqual([{ type: "text", text: "one" }]);
   });
+
+  it("uses compressed inline content for archived image attachments", async () => {
+    const client = new SlackFilesClient(async () => "token", 10);
+    const presignUrl = vi.fn().mockResolvedValue("https://archive/image");
+    const imageBlock = {
+      type: "image" as const,
+      source: {
+        type: "base64" as const,
+        media_type: "image/jpeg",
+        data: Buffer.from("small").toString("base64"),
+      },
+    };
+
+    await expect(
+      client.buildContentBlocksFromArchive(
+        [
+          {
+            file: { id: "F1" },
+            label: "photo.jpg",
+            mimeType: "image/jpeg",
+            modelMimeType: "image/jpeg",
+            status: "ready",
+            contentBytes: Buffer.from("large original"),
+            modelContentBytes: Buffer.from("small"),
+            contentBlocks: [{ type: "text", text: "Attached image: photo.jpg" }, imageBlock],
+          },
+        ],
+        [
+          {
+            sourceId: "src_1",
+            workspaceId: "T1",
+            sourceType: "slack_file",
+            sourceRef: "F1",
+            title: "photo.jpg",
+            slackFileId: "F1",
+            s3Bucket: "bucket",
+            s3Key: "raw/private/slack/T1/src_1/photo.jpg",
+            status: "archived",
+            createdAt: "2026-05-20T00:00:00.000Z",
+            updatedAt: "2026-05-20T00:00:00.000Z",
+          },
+        ],
+        { presignUrl },
+      ),
+    ).resolves.toEqual([{ type: "text", text: "Attached image: photo.jpg" }, imageBlock]);
+    expect(presignUrl).not.toHaveBeenCalled();
+  });
 });
 
 describe("SlackAuthClient", () => {
@@ -577,15 +624,19 @@ describe("SlackAttachmentArchiveService", () => {
 });
 
 describe("SecretsProvider", () => {
-  it("caches secret fetches and rejects secrets without strings", async () => {
-    const send = vi.fn().mockResolvedValueOnce({ SecretString: "value" });
+  it("caches SSM parameter fetches and rejects parameters without values", async () => {
+    const send = vi.fn().mockResolvedValueOnce({ Parameter: { Value: "value" } });
     const provider = new SecretsProvider({ send } as any);
 
-    await expect(provider.getSecretString("secret")).resolves.toBe("value");
-    await expect(provider.getSecretString("secret")).resolves.toBe("value");
+    await expect(provider.getSecretString("parameter")).resolves.toBe("value");
+    await expect(provider.getSecretString("parameter")).resolves.toBe("value");
     expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].input).toMatchObject({
+      Name: "parameter",
+      WithDecryption: true,
+    });
 
     const emptyProvider = new SecretsProvider({ send: vi.fn().mockResolvedValue({}) } as any);
-    await expect(emptyProvider.getSecretString("empty")).rejects.toThrow("does not contain SecretString");
+    await expect(emptyProvider.getSecretString("empty")).rejects.toThrow("does not contain a value");
   });
 });

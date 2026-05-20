@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { Jimp, JimpMime } from "jimp";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildSlackContextBlocks,
@@ -16,6 +17,10 @@ import {
   isTextLikeMimeType,
 } from "../src/slack/fileSupport";
 import {
+  compressSlackImageForModel,
+  isCompressibleSlackImageMimeType,
+} from "../src/slack/imageCompression";
+import {
   extractSlackQueueMessage,
   parseSlackEnvelope,
 } from "../src/slack/parseEvent";
@@ -23,6 +28,7 @@ import { verifySlackSignature } from "../src/slack/verifySignature";
 import {
   normalizeTextForSlack,
   splitTextForSlack,
+  stripModelThinking,
 } from "../src/shared/text";
 
 afterEach(() => {
@@ -55,6 +61,11 @@ describe("Slack text formatting", () => {
     expect(normalized).toContain("*bold* _em_ ~gone~ <https://example.com/a|site>");
     expect(normalized).toContain("`**literal** [x](https://example.com)`");
     expect(normalized).toContain("```\n__literal__\n```");
+  });
+
+  it("strips model thinking tags before Slack formatting", () => {
+    expect(stripModelThinking("<thinking>hidden</thinking>\nVisible")).toBe("Visible");
+    expect(normalizeTextForSlack("<think>hidden</think>\n**Visible**")).toBe("*Visible*");
   });
 });
 
@@ -169,6 +180,37 @@ describe("document content blocks", () => {
         text: "Attachment note: zip (application/zip) is not supported for inline analysis.",
       },
     ]);
+  });
+});
+
+describe("Slack image compression", () => {
+  it("compresses supported images into bounded JPEG model input", async () => {
+    const image = new Jimp({ width: 240, height: 120, color: 0x336699ff });
+    const bytes = Buffer.from(await image.getBuffer(JimpMime.png));
+
+    const compressed = await compressSlackImageForModel(bytes, "image/png", {
+      maxDimension: 64,
+      targetBytes: 20_000,
+    });
+
+    expect(compressed).toMatchObject({
+      mimeType: "image/jpeg",
+      originalBytes: bytes.byteLength,
+      originalWidth: 240,
+      originalHeight: 120,
+      width: 64,
+      height: 32,
+    });
+    expect(compressed!.compressedBytes).toBeLessThanOrEqual(20_000);
+    expect(compressed!.bytes.byteLength).toBe(compressed!.compressedBytes);
+  });
+
+  it("only treats static web image formats as compressible", async () => {
+    expect(isCompressibleSlackImageMimeType("image/jpeg")).toBe(true);
+    expect(isCompressibleSlackImageMimeType("image/png")).toBe(true);
+    expect(isCompressibleSlackImageMimeType("image/webp")).toBe(true);
+    expect(isCompressibleSlackImageMimeType("image/gif")).toBe(false);
+    await expect(compressSlackImageForModel(Buffer.from("gif"), "image/gif")).resolves.toBeNull();
   });
 });
 
@@ -473,6 +515,41 @@ describe("Slack context prompt blocks", () => {
     ).toEqual([
       { type: "text", text: "now" },
       { type: "text", text: "attachment" },
+    ]);
+  });
+
+  it("adds a default analysis instruction for attachment-only messages", () => {
+    expect(
+      buildSlackContextBlocks({
+        contextScope: "channel_top_level",
+        priorTurns: [],
+        currentText: "",
+        attachmentBlocks: [
+          { type: "text", text: "Attached image: IMG_0762.jpg" },
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/jpeg",
+              data: "abc",
+            },
+          },
+        ],
+      }),
+    ).toEqual([
+      {
+        type: "text",
+        text: expect.stringContaining("Analyze the attached content directly"),
+      },
+      { type: "text", text: "Attached image: IMG_0762.jpg" },
+      {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: "image/jpeg",
+          data: "abc",
+        },
+      },
     ]);
   });
 

@@ -9,7 +9,7 @@ interface BuildSlackContextBlocksInput {
 }
 
 export function buildSlackContextBlocks(input: BuildSlackContextBlocksInput): AgentContentBlock[] {
-  const text = buildPromptText(input.contextScope, input.priorTurns, input.currentText);
+  const text = buildPromptText(input.contextScope, input.priorTurns, input.currentText, input.attachmentBlocks.length > 0);
   return [
     {
       type: "text",
@@ -37,8 +37,9 @@ function buildPromptText(
   contextScope: "channel_top_level" | "thread",
   priorTurns: ConversationTurnRecord[],
   currentText: string,
+  hasAttachments: boolean,
 ): string {
-  const normalizedCurrentText = currentText.trim();
+  const normalizedCurrentText = currentText.trim() || buildDefaultAttachmentPrompt(hasAttachments);
 
   if (priorTurns.length === 0) {
     return normalizedCurrentText;
@@ -58,6 +59,19 @@ function buildPromptText(
     "Current user message:",
     normalizedCurrentText,
   ].join("\n");
+}
+
+function buildDefaultAttachmentPrompt(hasAttachments: boolean): string {
+  if (!hasAttachments) {
+    return "";
+  }
+
+  return [
+    "The user sent attachment(s) without an explicit instruction.",
+    "Analyze the attached content directly and summarize the visible information.",
+    "If the attachment is an image of a document, read the text from the image as best you can.",
+    "Answer in the language of the document or the surrounding conversation.",
+  ].join(" ");
 }
 
 function renderTurn(index: number, turn: ConversationTurnRecord): string {

@@ -63,8 +63,15 @@ export async function handler(
   const scheduledAtIso = resolveScheduledAtIso(event);
   const log = logger.child({ component: "scheduled-agent-runner", taskId });
 
-  let task = await taskRepository.get(taskId);
+  let task = detail.workspaceId
+    ? await taskRepository.get(detail.workspaceId, taskId)
+    : await taskRepository.getLegacy(taskId);
   if (!task) {
+    if (taskId !== "daily-summary" && !detail.prompt && !detail.outputChannelId) {
+      log.warn("Scheduled task definition was not found; skipping run");
+      return;
+    }
+
     task = await buildFallbackTask(detail, taskId);
     if (detail.persistTask !== false) {
       await taskRepository.save(task);
@@ -76,7 +83,8 @@ export async function handler(
   }
 
   if (!task.enabled) {
-    throw new Error(`Scheduled task ${taskId} is disabled`);
+    log.info("Scheduled task is disabled; skipping run");
+    return;
   }
 
   const autoClosedTasks = await autoCloseExpiredTasks(task.workspaceId, scheduledAtIso, log);
@@ -108,7 +116,7 @@ export async function handler(
 
   await slackClient.postMessage({
     channel: task.outputChannelId,
-    text: completion.text,
+    text: buildScheduledSlackMessage(task, completion.text),
   });
 
   const sessionId = completion.sessionId ?? reusableSessionRecord?.sessionId;
@@ -507,6 +515,19 @@ function buildScheduledPrompt(
   }
 
   return [...promptParts, "", basePrompt].join("\n");
+}
+
+function buildScheduledSlackMessage(task: ScheduledTask, text: string): string {
+  const reminderName = escapeSlackText(task.name.trim() || task.taskId);
+  const body = text.trim();
+  return [`*リマインダー:* ${reminderName}`, body].filter(Boolean).join("\n\n");
+}
+
+function escapeSlackText(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 function formatInTimeZone(date: Date, timeZone: string): {

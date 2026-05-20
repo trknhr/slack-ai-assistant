@@ -20,13 +20,20 @@ export function splitTextForSlack(text: string, maxLength = 3000): string[] {
 }
 
 export function normalizeTextForSlack(text: string): string {
-  return transformOutsideCode(text, (segment) =>
+  return transformOutsideCode(stripModelThinking(text), (segment) =>
     segment
       .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, "<$2|$1>")
       .replace(/\*\*(.+?)\*\*/gs, "*$1*")
       .replace(/__(.+?)__/gs, "_$1_")
       .replace(/~~(.+?)~~/gs, "~$1~"),
   ).trim();
+}
+
+export function stripModelThinking(text: string): string {
+  return text
+    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .trim();
 }
 
 function transformOutsideCode(text: string, transform: (segment: string) => string): string {

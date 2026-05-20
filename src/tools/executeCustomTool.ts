@@ -11,12 +11,20 @@ import { CalendarDraftRepository } from "../repo/calendarDraftRepository";
 import { ChannelMemoryRepository } from "../repo/channelMemoryRepository";
 import { MemoryItemRepository } from "../repo/memoryItemRepository";
 import { RecurringTaskRepository } from "../repo/recurringTaskRepository";
+import { TaskRepository } from "../repo/taskRepository";
 import { TaskEventRepository } from "../repo/taskEventRepository";
 import { TaskStateRepository } from "../repo/taskStateRepository";
 import { UserPreferenceRepository } from "../repo/userPreferenceRepository";
+import {
+  ScheduledReminderScheduler,
+  buildScheduleExpressionFromRecurrence,
+  extractDailyCronTime,
+} from "../scheduler/scheduledReminder";
 import { Logger } from "../shared/logger";
 import { RecurringTaskRecurrence, recurringTaskWeekdaySchema } from "../tasks/recurringTask";
+import { ScheduledTask } from "../tasks/taskDefinition";
 import { TaskStatus } from "../tasks/taskState";
+import { WeatherForecastProvider } from "../weather/openMeteo";
 
 const searchMemoriesSchema = z.object({
   query: z.string().min(1),
@@ -90,6 +98,60 @@ const upsertRecurringTaskSchema = z.object({
 
 const disableRecurringTaskSchema = z.object({
   recurring_task_id: z.string().min(1),
+});
+
+const scheduledReminderRecurrenceInputSchema = z.object({
+  frequency: z.enum(["daily", "weekly", "monthly"]),
+  time: z.string().regex(/^\d{1,2}:\d{2}$/),
+  days_of_week: z.array(recurringTaskWeekdaySchema).optional(),
+  days_of_month: z.array(z.number().int().min(1).max(31)).optional(),
+});
+
+const listScheduledRemindersSchema = z.object({
+  enabled: z.boolean().optional(),
+  limit: z.number().int().min(1).max(100).optional(),
+});
+
+const createScheduledReminderSchema = z
+  .object({
+    scheduled_task_id: z.string().min(1).optional(),
+    name: z.string().min(1),
+    prompt: z.string().min(1),
+    recurrence: scheduledReminderRecurrenceInputSchema.optional(),
+    schedule_expression: z.string().min(1).optional(),
+    timezone: z.string().min(1).optional(),
+    output_channel_id: z.string().min(1).optional(),
+    enabled: z.boolean().optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (!value.recurrence && !value.schedule_expression) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["recurrence"],
+        message: "A recurrence or schedule_expression is required.",
+      });
+    }
+  });
+
+const updateScheduledReminderSchema = z.object({
+  scheduled_task_id: z.string().min(1),
+  name: z.string().min(1).optional(),
+  prompt: z.string().min(1).optional(),
+  recurrence: scheduledReminderRecurrenceInputSchema.optional(),
+  schedule_expression: z.string().min(1).optional(),
+  timezone: z.string().min(1).optional(),
+  output_channel_id: z.string().min(1).optional(),
+  enabled: z.boolean().optional(),
+});
+
+const deleteScheduledReminderSchema = z.object({
+  scheduled_task_id: z.string().min(1),
+});
+
+const getWeatherForecastSchema = z.object({
+  location: z.string().min(1),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  timezone: z.string().min(1).optional(),
 });
 
 const listCalendarEventsSchema = z.object({
@@ -227,6 +289,7 @@ const discardCalendarDraftSchema = z.object({
 
 type CalendarDraftCandidateInput = z.infer<typeof calendarDraftCandidateSchema>;
 type RecurringTaskRecurrenceInput = z.infer<typeof recurringTaskRecurrenceInputSchema>;
+type ScheduledReminderRecurrenceInput = z.infer<typeof scheduledReminderRecurrenceInputSchema>;
 
 const DEFAULT_CALENDAR_TIME_ZONE = "Asia/Tokyo";
 const CALENDAR_PRIVATE_PROPERTY_KEYS = {
@@ -260,6 +323,7 @@ interface ToolRepositories {
   memoryItems: MemoryItemRepository;
   channelMemories?: ChannelMemoryRepository;
   userPreferences?: UserPreferenceRepository;
+  scheduledTasks?: TaskRepository;
   tasks: TaskStateRepository;
   taskEvents: TaskEventRepository;
   recurringTasks?: RecurringTaskRepository;
@@ -270,6 +334,8 @@ interface ToolIntegrations {
   googleCalendar?: GoogleCalendarClient;
   googleCalendarProvider?: () => GoogleCalendarClient | Promise<GoogleCalendarClient>;
   defaultCalendarTimeZone?: string;
+  scheduledReminderScheduler?: ScheduledReminderScheduler;
+  weatherProvider?: WeatherForecastProvider;
 }
 
 export interface ToolExecutionSummary {
@@ -321,6 +387,16 @@ export class CustomToolExecutor {
           return await this.upsertRecurringTask(input);
         case "disable_recurring_task":
           return await this.disableRecurringTask(input);
+        case "list_scheduled_reminders":
+          return await this.listScheduledReminders(input);
+        case "create_scheduled_reminder":
+          return await this.createScheduledReminder(input);
+        case "update_scheduled_reminder":
+          return await this.updateScheduledReminder(input);
+        case "delete_scheduled_reminder":
+          return await this.deleteScheduledReminder(input);
+        case "get_weather_forecast":
+          return await this.getWeatherForecast(input);
         case "list_google_calendars":
           return await this.listGoogleCalendars(input);
         case "list_calendar_events":
@@ -727,6 +803,170 @@ export class CustomToolExecutor {
     });
   }
 
+  private async listScheduledReminders(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = listScheduledRemindersSchema.parse(input);
+    const repository = this.requireScheduledTaskRepository();
+    const tasks = await repository.list({
+      workspaceId: this.context.workspaceId,
+      enabled: parsed.enabled,
+      limit: parsed.limit,
+    });
+
+    return jsonResult({
+      count: tasks.length,
+      scheduled_reminders: tasks.map(serializeScheduledReminder),
+    });
+  }
+
+  private async createScheduledReminder(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = createScheduledReminderSchema.parse(input);
+    const repository = this.requireScheduledTaskRepository();
+    const scheduler = this.requireScheduledReminderScheduler();
+    const now = new Date().toISOString();
+    const taskId = normalizeOptionalString(parsed.scheduled_task_id) ?? `sched_${randomUUID().slice(0, 8)}`;
+    const existing = await repository.get(this.context.workspaceId, taskId);
+    if (existing) {
+      throw new Error(
+        `Scheduled reminder ${taskId} already exists in this workspace. Use update_scheduled_reminder to change it.`,
+      );
+    }
+    const outputChannelId = parsed.output_channel_id ?? this.context.channelId;
+    if (!outputChannelId) {
+      return errorResult("A Slack output channel is required to create a scheduled reminder.");
+    }
+
+    const scheduleExpression = resolveScheduledReminderExpression({
+      recurrence: parsed.recurrence,
+      scheduleExpression: parsed.schedule_expression,
+    });
+    const task: ScheduledTask = {
+      taskId,
+      name: parsed.name,
+      prompt: parsed.prompt,
+      workspaceId: this.context.workspaceId,
+      outputChannelId,
+      enabled: parsed.enabled ?? true,
+      scheduleName: scheduler.buildScheduleName(this.context.workspaceId, taskId),
+      scheduleExpression,
+      scheduleExpressionTimezone: parsed.timezone ?? this.getDefaultCalendarTimeZone(),
+      createdByUserId: this.context.userId,
+      updatedByUserId: this.context.userId,
+      reuseSession: false,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const schedule = await scheduler.put(task);
+    const savedTask = {
+      ...task,
+      scheduleName: schedule.scheduleName,
+      scheduleGroupName: schedule.scheduleGroupName,
+    };
+    await repository.save(savedTask);
+
+    return jsonResult({
+      saved: true,
+      scheduled_reminder: serializeScheduledReminder(savedTask),
+    });
+  }
+
+  private async updateScheduledReminder(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = updateScheduledReminderSchema.parse(input);
+    const repository = this.requireScheduledTaskRepository();
+    const scheduler = this.requireScheduledReminderScheduler();
+    const existing = await repository.get(this.context.workspaceId, parsed.scheduled_task_id);
+    if (!existing || existing.workspaceId !== this.context.workspaceId) {
+      throw new Error(`Scheduled reminder ${parsed.scheduled_task_id} was not found`);
+    }
+
+    const scheduleExpression =
+      parsed.recurrence || parsed.schedule_expression
+        ? resolveScheduledReminderExpression({
+            recurrence: parsed.recurrence,
+            scheduleExpression: parsed.schedule_expression,
+          })
+        : existing.scheduleExpression;
+    if (!scheduleExpression) {
+      throw new Error(`Scheduled reminder ${existing.taskId} does not have a schedule expression`);
+    }
+
+    const updated: ScheduledTask = {
+      ...existing,
+      name: parsed.name ?? existing.name,
+      prompt: parsed.prompt ?? existing.prompt,
+      outputChannelId: parsed.output_channel_id ?? existing.outputChannelId,
+      enabled: parsed.enabled ?? existing.enabled,
+      scheduleName: existing.scheduleName ?? scheduler.buildScheduleName(existing.workspaceId, existing.taskId),
+      scheduleExpression,
+      scheduleExpressionTimezone:
+        parsed.timezone ?? existing.scheduleExpressionTimezone ?? this.getDefaultCalendarTimeZone(),
+      updatedByUserId: this.context.userId,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const schedule = await scheduler.put(updated);
+    const savedTask = {
+      ...updated,
+      scheduleName: schedule.scheduleName,
+      scheduleGroupName: schedule.scheduleGroupName,
+    };
+    await repository.save(savedTask);
+
+    return jsonResult({
+      updated: true,
+      scheduled_reminder: serializeScheduledReminder(savedTask),
+    });
+  }
+
+  private async deleteScheduledReminder(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = deleteScheduledReminderSchema.parse(input);
+    const repository = this.requireScheduledTaskRepository();
+    const scheduler = this.requireScheduledReminderScheduler();
+    const existing = await repository.get(this.context.workspaceId, parsed.scheduled_task_id);
+    if (!existing || existing.workspaceId !== this.context.workspaceId) {
+      throw new Error(`Scheduled reminder ${parsed.scheduled_task_id} was not found`);
+    }
+
+    await scheduler.delete(existing);
+    await repository.delete(existing.workspaceId, existing.taskId);
+
+    return jsonResult({
+      deleted: true,
+      scheduled_task_id: existing.taskId,
+      name: existing.name,
+    });
+  }
+
+  private async getWeatherForecast(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const parsed = getWeatherForecastSchema.parse(input);
+    const forecast = await this.requireWeatherProvider().getForecast({
+      location: parsed.location,
+      date: parsed.date,
+      timezone: parsed.timezone ?? this.getDefaultCalendarTimeZone(),
+    });
+
+    return jsonResult({
+      location: {
+        name: forecast.locationName,
+        country: forecast.country,
+        admin1: forecast.admin1,
+        latitude: forecast.latitude,
+        longitude: forecast.longitude,
+      },
+      date: forecast.date,
+      timezone: forecast.timezone,
+      weather_code: forecast.weatherCode,
+      weather: forecast.weatherDescription,
+      temperature_max_c: forecast.temperatureMaxC,
+      temperature_min_c: forecast.temperatureMinC,
+      precipitation_probability_max_pct: forecast.precipitationProbabilityMaxPct,
+      precipitation_mm: forecast.precipitationMm,
+      wind_speed_max_kmh: forecast.windSpeedMaxKmh,
+      umbrella_note: forecast.umbrellaNote,
+      summary: forecast.summary,
+    });
+  }
+
   private async listGoogleCalendars(input: Record<string, unknown>): Promise<ToolExecutionResult> {
     const parsed = listGoogleCalendarsSchema.parse(input);
     const calendar = await this.requireGoogleCalendar();
@@ -1086,6 +1326,27 @@ export class CustomToolExecutor {
     return this.repositories.recurringTasks;
   }
 
+  private requireScheduledTaskRepository(): TaskRepository {
+    if (!this.repositories.scheduledTasks) {
+      throw new Error("Scheduled reminder storage is not configured");
+    }
+    return this.repositories.scheduledTasks;
+  }
+
+  private requireScheduledReminderScheduler(): ScheduledReminderScheduler {
+    if (!this.integrations.scheduledReminderScheduler) {
+      throw new Error("Scheduled reminder schedule management is not configured");
+    }
+    return this.integrations.scheduledReminderScheduler;
+  }
+
+  private requireWeatherProvider(): WeatherForecastProvider {
+    if (!this.integrations.weatherProvider) {
+      throw new Error("Weather forecast integration is not configured");
+    }
+    return this.integrations.weatherProvider;
+  }
+
   private getDefaultCalendarTimeZone(): string {
     return this.integrations.defaultCalendarTimeZone ?? DEFAULT_CALENDAR_TIME_ZONE;
   }
@@ -1439,6 +1700,44 @@ function serializeGoogleEventTime(
 function normalizeOptionalString(value?: string): string | undefined {
   const normalized = value?.trim();
   return normalized ? normalized : undefined;
+}
+
+function resolveScheduledReminderExpression(input: {
+  recurrence?: ScheduledReminderRecurrenceInput;
+  scheduleExpression?: string;
+}): string {
+  const scheduleExpression = normalizeOptionalString(input.scheduleExpression);
+  if (scheduleExpression) {
+    return scheduleExpression;
+  }
+  if (!input.recurrence) {
+    throw new Error("A recurrence or schedule_expression is required for scheduled reminders.");
+  }
+  return buildScheduleExpressionFromRecurrence({
+    frequency: input.recurrence.frequency,
+    time: input.recurrence.time,
+    daysOfWeek: input.recurrence.days_of_week,
+    daysOfMonth: input.recurrence.days_of_month,
+  });
+}
+
+function serializeScheduledReminder(task: ScheduledTask): Record<string, unknown> {
+  return {
+    scheduled_task_id: task.taskId,
+    name: task.name,
+    prompt: task.prompt,
+    output_channel_id: task.outputChannelId,
+    enabled: task.enabled,
+    schedule_name: task.scheduleName,
+    schedule_group_name: task.scheduleGroupName,
+    schedule_expression: task.scheduleExpression,
+    timezone: task.scheduleExpressionTimezone,
+    time: extractDailyCronTime(task.scheduleExpression),
+    created_by_user_id: task.createdByUserId,
+    updated_by_user_id: task.updatedByUserId,
+    created_at: task.createdAt,
+    updated_at: task.updatedAt,
+  };
 }
 
 function normalizeRecurringTaskRecurrence(

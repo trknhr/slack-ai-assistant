@@ -3,6 +3,7 @@ import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { SecretsProvider } from "../../aws/secretsProvider";
 import { loadIngressEnv } from "../../config/env";
 import { EventDedupRepository } from "../../repo/eventDedupRepository";
+import { ProviderBindingRepository } from "../../repo/providerBindingRepository";
 import { logger } from "../../shared/logger";
 import { extractSlackQueueMessage, parseSlackEnvelope } from "../../slack/parseEvent";
 import { verifySlackSignature } from "../../slack/verifySignature";
@@ -11,6 +12,7 @@ const env = loadIngressEnv();
 const sqs = new SQSClient({});
 const secretsProvider = new SecretsProvider();
 const eventDedupRepository = new EventDedupRepository(env.PROCESSED_EVENTS_TABLE_NAME);
+const providerBindingRepository = new ProviderBindingRepository(env.PROVIDER_BINDINGS_TABLE_NAME);
 
 export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
   const requestId = event.requestContext.requestId;
@@ -64,19 +66,42 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     return response(200, { ok: true, ignored: true });
   }
 
+  const resolvedWorkspace = await providerBindingRepository.resolveWorkspace({
+    provider: "slack",
+    providerAccountId: queueMessage.workspaceId,
+    providerConversationKey: `channel:${queueMessage.channelId}`,
+    fallbackWorkspaceId: queueMessage.workspaceId,
+  });
+
+  if (!resolvedWorkspace) {
+    log.info("Slack event ignored because provider binding is disabled", {
+      eventId: queueMessage.eventId,
+      providerAccountId: queueMessage.workspaceId,
+      channelId: queueMessage.channelId,
+    });
+    return response(200, { ok: true, ignored: true });
+  }
+
+  const resolvedQueueMessage = {
+    ...queueMessage,
+    workspaceId: resolvedWorkspace.workspaceId,
+  };
+
   await sqs.send(
     new SendMessageCommand({
       QueueUrl: env.SLACK_QUEUE_URL,
-      MessageBody: JSON.stringify(queueMessage),
+      MessageBody: JSON.stringify(resolvedQueueMessage),
     }),
   );
 
   log.info("Slack event enqueued", {
-    eventId: queueMessage.eventId,
-    channelId: queueMessage.channelId,
-    conversationTs: queueMessage.conversationTs,
-    replyThreadTs: queueMessage.replyThreadTs,
-    contextScope: queueMessage.contextScope,
+    eventId: resolvedQueueMessage.eventId,
+    workspaceId: resolvedQueueMessage.workspaceId,
+    workspaceResolution: resolvedWorkspace.source,
+    channelId: resolvedQueueMessage.channelId,
+    conversationTs: resolvedQueueMessage.conversationTs,
+    replyThreadTs: resolvedQueueMessage.replyThreadTs,
+    contextScope: resolvedQueueMessage.contextScope,
   });
 
   return response(200, { ok: true });

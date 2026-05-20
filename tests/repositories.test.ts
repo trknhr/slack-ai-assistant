@@ -6,6 +6,7 @@ import { ConversationTurnRepository } from "../src/repo/conversationTurnReposito
 import { EventDedupRepository } from "../src/repo/eventDedupRepository";
 import { GoogleOAuthConnectionRepository } from "../src/repo/googleOAuthConnectionRepository";
 import { MemoryItemRepository } from "../src/repo/memoryItemRepository";
+import { ProviderBindingRepository } from "../src/repo/providerBindingRepository";
 import { RecurringTaskRepository } from "../src/repo/recurringTaskRepository";
 import { SessionRepository } from "../src/repo/sessionRepository";
 import { SourceDocumentRepository } from "../src/repo/sourceDocumentRepository";
@@ -153,6 +154,114 @@ describe("basic DynamoDB repositories", () => {
     await expect(repo.findByConversation("T1", "C1", "missing")).resolves.toBeNull();
   });
 
+  it("resolves provider workspace bindings with conversation, installation, and fallback order", async () => {
+    const repo = new ProviderBindingRepository("provider-bindings");
+    sendMock.mockResolvedValueOnce({});
+
+    await repo.save({
+      provider: "line",
+      providerAccountId: "Ubot",
+      bindingKind: "conversation",
+      providerConversationKey: "group:G1",
+      workspaceId: "ws_group",
+      conversationId: "line:group:G1",
+      status: "active",
+      createdAt: "created",
+      updatedAt: "updated",
+    });
+    expect(commandInput()).toMatchObject({
+      TableName: "provider-bindings",
+      Item: {
+        pk: "PROVIDER#line#ACCOUNT#Ubot",
+        sk: "CONVERSATION#group:G1",
+        workspaceId: "ws_group",
+        conversationId: "line:group:G1",
+      },
+    });
+
+    sendMock.mockResolvedValueOnce({
+      Item: {
+        provider: "line",
+        providerAccountId: "Ubot",
+        bindingKind: "conversation",
+        providerConversationKey: "group:G1",
+        workspaceId: "ws_group",
+        conversationId: "line:group:G1",
+        status: "active",
+        createdAt: "created",
+        updatedAt: "updated",
+      },
+    });
+    await expect(
+      repo.resolveWorkspace({
+        provider: "line",
+        providerAccountId: "Ubot",
+        providerConversationKey: "group:G1",
+        fallbackWorkspaceId: "line:group:G1",
+      }),
+    ).resolves.toEqual({
+      workspaceId: "ws_group",
+      source: "conversation_binding",
+    });
+
+    sendMock.mockResolvedValueOnce({}).mockResolvedValueOnce({
+      Item: {
+        provider: "line",
+        providerAccountId: "Ubot",
+        bindingKind: "installation",
+        workspaceId: "ws_install",
+        status: "active",
+        createdAt: "created",
+        updatedAt: "updated",
+      },
+    });
+    await expect(
+      repo.resolveWorkspace({
+        provider: "line",
+        providerAccountId: "Ubot",
+        providerConversationKey: "room:R1",
+        fallbackWorkspaceId: "line:room:R1",
+      }),
+    ).resolves.toEqual({
+      workspaceId: "ws_install",
+      source: "installation_binding",
+    });
+
+    sendMock.mockResolvedValueOnce({}).mockResolvedValueOnce({});
+    await expect(
+      repo.resolveWorkspace({
+        provider: "line",
+        providerAccountId: "Ubot",
+        providerConversationKey: "user:U1",
+        fallbackWorkspaceId: "line:user:U1",
+      }),
+    ).resolves.toEqual({
+      workspaceId: "line:user:U1",
+      source: "fallback",
+    });
+
+    sendMock.mockResolvedValueOnce({
+      Item: {
+        provider: "line",
+        providerAccountId: "Ubot",
+        bindingKind: "conversation",
+        providerConversationKey: "group:G2",
+        workspaceId: "ws_disabled",
+        status: "disabled",
+        createdAt: "created",
+        updatedAt: "updated",
+      },
+    });
+    await expect(
+      repo.resolveWorkspace({
+        provider: "line",
+        providerAccountId: "Ubot",
+        providerConversationKey: "group:G2",
+        fallbackWorkspaceId: "line:group:G2",
+      }),
+    ).resolves.toBeNull();
+  });
+
   it("finds and saves user memory records", async () => {
     const repo = new UserMemoryRepository("memory");
     sendMock.mockResolvedValueOnce({
@@ -205,17 +314,22 @@ describe("task repositories", () => {
         workspaceId: "T1",
         outputChannelId: "C1",
         enabled: true,
+        scheduleName: "slack-ai-assistant-task1",
+        scheduleGroupName: "default",
+        scheduleExpression: "cron(0 8 * * ? *)",
+        scheduleExpressionTimezone: "Asia/Tokyo",
         createdAt: "created",
         updatedAt: "updated",
       },
     });
 
-    await expect(repo.get("task1")).resolves.toMatchObject({
+    await expect(repo.get("T1", "task1")).resolves.toMatchObject({
       taskId: "task1",
       reuseSession: false,
+      scheduleExpression: "cron(0 8 * * ? *)",
     });
     expect(commandInput()).toMatchObject({
-      Key: { pk: "TASK#task1" },
+      Key: { pk: "WORKSPACE#T1#TASK#task1" },
     });
 
     sendMock.mockResolvedValueOnce({});
@@ -226,6 +340,10 @@ describe("task repositories", () => {
       workspaceId: "T1",
       outputChannelId: "C1",
       enabled: true,
+      scheduleName: "slack-ai-assistant-task1",
+      scheduleGroupName: "default",
+      scheduleExpression: "cron(0 8 * * ? *)",
+      scheduleExpressionTimezone: "Asia/Tokyo",
       reuseSession: true,
       memoryStoreId: "memory",
       vaultIds: ["vault"],
@@ -234,14 +352,61 @@ describe("task repositories", () => {
     });
     expect(commandInput(1)).toMatchObject({
       Item: {
-        pk: "TASK#task1",
+        pk: "WORKSPACE#T1#TASK#task1",
+        scheduleName: "slack-ai-assistant-task1",
+        scheduleExpression: "cron(0 8 * * ? *)",
         reuseSession: true,
         vaultIds: ["vault"],
       },
     });
+    expect(commandInput(2)).toMatchObject({
+      Key: { pk: "TASK#task1" },
+      ConditionExpression: "#workspaceId = :workspaceId",
+      ExpressionAttributeValues: {
+        ":workspaceId": "T1",
+      },
+    });
+
+    sendMock.mockResolvedValueOnce({
+      Items: [
+        {
+          taskId: "task1",
+          name: "Digest",
+          prompt: "Summarize",
+          workspaceId: "T1",
+          outputChannelId: "C1",
+          enabled: true,
+          scheduleName: "slack-ai-assistant-task1",
+          scheduleExpression: "cron(0 8 * * ? *)",
+          scheduleExpressionTimezone: "Asia/Tokyo",
+          createdAt: "created",
+          updatedAt: "updated",
+        },
+      ],
+    });
+    await expect(repo.list({ workspaceId: "T1", enabled: true })).resolves.toHaveLength(1);
+    expect(commandInput(3)).toMatchObject({
+      IndexName: "WorkspaceIndex",
+      KeyConditionExpression: "#workspaceId = :workspaceId",
+      FilterExpression: "#enabled = :enabled",
+      ExpressionAttributeValues: {
+        ":workspaceId": "T1",
+        ":enabled": true,
+      },
+    });
 
     sendMock.mockResolvedValueOnce({});
-    await expect(repo.get("missing")).resolves.toBeNull();
+    await repo.delete("T1", "task1");
+    expect(commandInput(4)).toMatchObject({
+      Key: { pk: "WORKSPACE#T1#TASK#task1" },
+    });
+    expect(commandInput(5)).toMatchObject({
+      Key: { pk: "TASK#task1" },
+      ConditionExpression: "#workspaceId = :workspaceId",
+    });
+
+    sendMock.mockResolvedValueOnce({}).mockResolvedValueOnce({});
+    await expect(repo.get("T1", "missing")).resolves.toBeNull();
   });
 
   it("saves task events with generated ids and timestamps", async () => {

@@ -55,6 +55,7 @@ export const agentContentBlockSchema = z.union([
 
 export const agentRuntimeResourcesSchema = z.object({
   memoryItemsTableName: z.string().min(1),
+  scheduledTasksTableName: z.string().min(1),
   tasksTableName: z.string().min(1),
   taskEventsTableName: z.string().min(1),
   recurringTasksTableName: z.string().min(1),
@@ -63,6 +64,11 @@ export const agentRuntimeResourcesSchema = z.object({
   googleCalendarSecretId: z.string().min(1),
   googleOAuthStartUrl: z.string().min(1).optional(),
   googleCalendarTimeZone: z.string().min(1),
+  schedulerScheduleGroupName: z.string().min(1).optional(),
+  schedulerScheduleNamePrefix: z.string().min(1).optional(),
+  schedulerDefaultTimeZone: z.string().min(1).optional(),
+  schedulerTargetArn: z.string().min(1).optional(),
+  schedulerTargetRoleArn: z.string().min(1).optional(),
 });
 
 export const agentToolContextSchema = z.object({
@@ -111,6 +117,7 @@ export type AgentRuntimeResponse = z.infer<typeof agentRuntimeResponseSchema>;
 
 export interface ToolRuntimeEnvironment {
   MEMORY_ITEMS_TABLE_NAME: string;
+  TASK_TABLE_NAME: string;
   TASKS_TABLE_NAME: string;
   TASK_EVENTS_TABLE_NAME: string;
   RECURRING_TASKS_TABLE_NAME: string;
@@ -119,11 +126,17 @@ export interface ToolRuntimeEnvironment {
   GOOGLE_CALENDAR_SECRET_ID: string;
   GOOGLE_OAUTH_START_URL?: string;
   GOOGLE_CALENDAR_TIME_ZONE: string;
+  SCHEDULER_SCHEDULE_GROUP_NAME?: string;
+  SCHEDULER_SCHEDULE_NAME_PREFIX?: string;
+  SCHEDULER_DEFAULT_TIME_ZONE?: string;
+  SCHEDULER_TARGET_ARN?: string;
+  SCHEDULER_TARGET_ROLE_ARN?: string;
 }
 
 export function buildAgentRuntimeResources(env: ToolRuntimeEnvironment): AgentRuntimeResources {
   return {
     memoryItemsTableName: env.MEMORY_ITEMS_TABLE_NAME,
+    scheduledTasksTableName: env.TASK_TABLE_NAME,
     tasksTableName: env.TASKS_TABLE_NAME,
     taskEventsTableName: env.TASK_EVENTS_TABLE_NAME,
     recurringTasksTableName: env.RECURRING_TASKS_TABLE_NAME,
@@ -132,5 +145,10 @@ export function buildAgentRuntimeResources(env: ToolRuntimeEnvironment): AgentRu
     googleCalendarSecretId: env.GOOGLE_CALENDAR_SECRET_ID,
     googleOAuthStartUrl: env.GOOGLE_OAUTH_START_URL,
     googleCalendarTimeZone: env.GOOGLE_CALENDAR_TIME_ZONE,
+    schedulerScheduleGroupName: env.SCHEDULER_SCHEDULE_GROUP_NAME,
+    schedulerScheduleNamePrefix: env.SCHEDULER_SCHEDULE_NAME_PREFIX,
+    schedulerDefaultTimeZone: env.SCHEDULER_DEFAULT_TIME_ZONE,
+    schedulerTargetArn: env.SCHEDULER_TARGET_ARN,
+    schedulerTargetRoleArn: env.SCHEDULER_TARGET_ROLE_ARN,
   };
 }

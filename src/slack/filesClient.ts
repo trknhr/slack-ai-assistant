@@ -1,10 +1,18 @@
 import { AgentContentBlock } from "../agent/types";
-import { buildAgentContentBlocksForDocument } from "../documents/contentBlocks";
+import {
+  buildAgentContentBlocksForDocument,
+  buildAgentContentBlocksForDocumentUrl,
+} from "../documents/contentBlocks";
+import { SourceDocument } from "../documents/sourceDocument";
 import { SlackFileReference } from "../shared/contracts";
 import {
   inferMimeTypeFromName,
   isSupportedSlackArchiveMimeType,
 } from "./fileSupport";
+import {
+  compressSlackImageForModel,
+  isCompressibleSlackImageMimeType,
+} from "./imageCompression";
 
 interface SlackApiFileInfoResponse {
   ok: boolean;
@@ -39,6 +47,8 @@ export interface PreparedSlackAttachment {
   status: PreparedSlackAttachmentStatus;
   contentBlocks: AgentContentBlock[];
   contentBytes?: Buffer;
+  modelContentBytes?: Buffer;
+  modelMimeType?: string;
 }
 
 export class SlackFilesClient {
@@ -77,6 +87,76 @@ export class SlackFilesClient {
     const blocks: AgentContentBlock[] = [];
 
     for (const attachment of attachments.slice(0, maxInlineFiles)) {
+      blocks.push(...attachment.contentBlocks);
+    }
+
+    if (attachments.length > maxInlineFiles) {
+      blocks.push({
+        type: "text",
+        text: `Attachment note: ${attachments.length - maxInlineFiles} additional file(s) were archived but omitted from inline analysis to keep the request bounded.`,
+      });
+    }
+
+    return blocks;
+  }
+
+  async buildContentBlocksFromArchive(
+    attachments: PreparedSlackAttachment[],
+    archivedDocuments: SourceDocument[],
+    input: {
+      presignUrl: (document: SourceDocument) => Promise<string>;
+      maxInlineFiles?: number;
+      maxInlineBase64Bytes?: number;
+    },
+  ): Promise<AgentContentBlock[]> {
+    const blocks: AgentContentBlock[] = [];
+    const maxInlineFiles = input.maxInlineFiles ?? 3;
+    const maxInlineBase64Bytes = input.maxInlineBase64Bytes ?? 750_000;
+    const documentsByFileId = new Map(
+      archivedDocuments
+        .filter((document) => document.slackFileId)
+        .map((document) => [document.slackFileId!, document]),
+    );
+
+    for (const attachment of attachments.slice(0, maxInlineFiles)) {
+      const modelBytes = attachment.modelContentBytes ?? attachment.contentBytes;
+      if (attachment.status === "ready" && isCompressibleSlackImageMimeType(attachment.modelMimeType ?? attachment.mimeType)) {
+        if (modelBytes && modelBytes.byteLength <= maxInlineBase64Bytes) {
+          blocks.push(...attachment.contentBlocks);
+        } else {
+          blocks.push({
+            type: "text",
+            text: `Attachment note: ${attachment.label} could not be attached inline because it was too large after image compression.`,
+          });
+        }
+        continue;
+      }
+
+      const document = documentsByFileId.get(attachment.file.id);
+      if (document?.status === "archived" && document.s3Bucket && document.s3Key) {
+        try {
+          const url = await input.presignUrl(document);
+          blocks.push(...buildAgentContentBlocksForDocumentUrl(attachment.label, attachment.mimeType, url));
+          continue;
+        } catch (error) {
+          blocks.push({
+            type: "text",
+            text: `Attachment note: ${attachment.label} was archived but could not be attached by URL. ${
+              error instanceof Error ? error.message : "Unknown presign error"
+            }`,
+          });
+          continue;
+        }
+      }
+
+      if (modelBytes && modelBytes.byteLength > maxInlineBase64Bytes) {
+        blocks.push({
+          type: "text",
+          text: `Attachment note: ${attachment.label} was archived but omitted from inline analysis because it would make the request too large.`,
+        });
+        continue;
+      }
+
       blocks.push(...attachment.contentBlocks);
     }
 
@@ -172,13 +252,17 @@ export class SlackFilesClient {
       };
     }
 
+    const modelInput = await buildModelInputContent(label, mimeType, buffer);
+
     return {
       file: resolved,
       label,
       mimeType,
       status: "ready",
       contentBytes: buffer,
-      contentBlocks: buildAgentContentBlocksForDocument(label, mimeType, buffer),
+      modelContentBytes: modelInput.bytes,
+      modelMimeType: modelInput.mimeType,
+      contentBlocks: buildAgentContentBlocksForDocument(label, modelInput.mimeType, modelInput.bytes),
     };
   }
 
@@ -238,4 +322,30 @@ export class SlackFilesClient {
 
     return Buffer.from(await response.arrayBuffer());
   }
+}
+
+async function buildModelInputContent(
+  label: string,
+  mimeType: string | undefined,
+  buffer: Buffer,
+): Promise<{ bytes: Buffer; mimeType: string | undefined }> {
+  try {
+    const compressed = await compressSlackImageForModel(buffer, mimeType);
+    if (compressed) {
+      return {
+        bytes: compressed.bytes,
+        mimeType: compressed.mimeType,
+      };
+    }
+  } catch {
+    return {
+      bytes: buffer,
+      mimeType,
+    };
+  }
+
+  return {
+    bytes: buffer,
+    mimeType,
+  };
 }

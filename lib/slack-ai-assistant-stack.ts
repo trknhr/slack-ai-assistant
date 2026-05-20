@@ -7,7 +7,6 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as nodejs from "aws-cdk-lib/aws-lambda-nodejs";
 import * as scheduler from "aws-cdk-lib/aws-scheduler";
-import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import {
@@ -23,17 +22,36 @@ export class SlackAiAssistantStack extends Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const slackSigningSecretName =
-      resolveOptionalConfigValue(this, "slackSigningSecretName", "SLACK_SIGNING_SECRET_NAME") ??
+    const slackSigningParameterName =
+      resolveOptionalConfigValue(this, "slackSigningParameterName", "SLACK_SIGNING_PARAMETER_NAME") ??
       "/slack-ai-assistant/slack-signing-secret";
-    const slackBotTokenSecretName =
-      resolveOptionalConfigValue(this, "slackBotTokenSecretName", "SLACK_BOT_TOKEN_SECRET_NAME") ??
+    const slackBotTokenParameterName =
+      resolveOptionalConfigValue(this, "slackBotTokenParameterName", "SLACK_BOT_TOKEN_PARAMETER_NAME") ??
       "/slack-ai-assistant/slack-bot-token";
-    const googleCalendarSecretName =
-      resolveOptionalConfigValue(this, "googleCalendarSecretName", "GOOGLE_CALENDAR_SECRET_NAME") ??
+    const lineChannelSecretParameterName =
+      resolveOptionalConfigValue(this, "lineChannelSecretParameterName", "LINE_CHANNEL_SECRET_PARAMETER_NAME") ??
+      "/slack-ai-assistant/line-channel-secret";
+    const lineChannelAccessTokenParameterName =
+      resolveOptionalConfigValue(
+        this,
+        "lineChannelAccessTokenParameterName",
+        "LINE_CHANNEL_ACCESS_TOKEN_PARAMETER_NAME",
+      ) ??
+      "/slack-ai-assistant/line-channel-access-token";
+    const googleCalendarParameterName =
+      resolveOptionalConfigValue(this, "googleCalendarParameterName", "GOOGLE_CALENDAR_PARAMETER_NAME") ??
       "/slack-ai-assistant/google-calendar";
     const googleCalendarTimeZone =
       resolveOptionalConfigValue(this, "googleCalendarTimeZone", "GOOGLE_CALENDAR_TIME_ZONE") ?? "Asia/Tokyo";
+    const schedulerScheduleGroupName =
+      resolveOptionalConfigValue(this, "schedulerScheduleGroupName", "SCHEDULER_SCHEDULE_GROUP_NAME") ??
+      "default";
+    const schedulerScheduleNamePrefix =
+      resolveOptionalConfigValue(this, "schedulerScheduleNamePrefix", "SCHEDULER_SCHEDULE_NAME_PREFIX") ??
+      "slack-ai-assistant";
+    const schedulerDefaultTimeZone =
+      resolveOptionalConfigValue(this, "schedulerDefaultTimeZone", "SCHEDULER_DEFAULT_TIME_ZONE") ??
+      googleCalendarTimeZone;
     const defaultScheduleChannel =
       resolveOptionalConfigValue(this, "defaultScheduleChannel", "DEFAULT_SCHEDULE_CHANNEL") ??
       "C_PLACEHOLDER";
@@ -47,7 +65,7 @@ export class SlackAiAssistantStack extends Stack {
       resolveOptionalConfigValue(this, "bedrockModelId", "BEDROCK_MODEL_ID") ?? "moonshotai.kimi-k2.5";
     const bedrockDocumentModelId =
       resolveOptionalConfigValue(this, "bedrockDocumentModelId", "BEDROCK_DOCUMENT_MODEL_ID") ??
-      "apac.anthropic.claude-sonnet-4-20250514-v1:0";
+      bedrockModelId;
 
     const sessionTable = new dynamodb.Table(this, "SlackThreadSessionsTable", {
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
@@ -137,8 +155,21 @@ export class SlackAiAssistantStack extends Stack {
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
     });
+    scheduledTasksTable.addGlobalSecondaryIndex({
+      indexName: "WorkspaceIndex",
+      partitionKey: { name: "workspaceId", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "taskId", type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
 
     const recurringTasksTable = new dynamodb.Table(this, "RecurringTasksTable", {
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+    });
+
+    const providerBindingsTable = new dynamodb.Table(this, "ProviderBindingsTable", {
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -177,6 +208,18 @@ export class SlackAiAssistantStack extends Stack {
       },
     });
 
+    const lineEventsDlq = new sqs.Queue(this, "LineEventsDlq", {
+      retentionPeriod: Duration.days(14),
+    });
+
+    const lineEventsQueue = new sqs.Queue(this, "LineEventsQueue", {
+      visibilityTimeout: Duration.minutes(5),
+      deadLetterQueue: {
+        queue: lineEventsDlq,
+        maxReceiveCount: 3,
+      },
+    });
+
     const documentImportDlq = new sqs.Queue(this, "DocumentImportDlq", {
       retentionPeriod: Duration.days(14),
     });
@@ -200,7 +243,7 @@ export class SlackAiAssistantStack extends Stack {
       throw new Error("AgentCore runtime SlackAgent was not created.");
     }
 
-    const commonEnvironment = {
+    const commonRuntimeEnvironment = {
       SESSION_TABLE_NAME: sessionTable.tableName,
       CONVERSATION_SESSIONS_TABLE_NAME: conversationSessionsTable.tableName,
       CONVERSATION_TURNS_TABLE_NAME: conversationTurnsTable.tableName,
@@ -209,22 +252,32 @@ export class SlackAiAssistantStack extends Stack {
       TASKS_TABLE_NAME: tasksTable.tableName,
       TASK_EVENTS_TABLE_NAME: taskEventsTable.tableName,
       RECURRING_TASKS_TABLE_NAME: recurringTasksTable.tableName,
+      PROVIDER_BINDINGS_TABLE_NAME: providerBindingsTable.tableName,
       PROCESSED_EVENTS_TABLE_NAME: processedEventsTable.tableName,
       TASK_TABLE_NAME: scheduledTasksTable.tableName,
-      SLACK_SIGNING_SECRET_SECRET_ID: slackSigningSecretName,
-      SLACK_BOT_TOKEN_SECRET_ID: slackBotTokenSecretName,
+      SLACK_SIGNING_SECRET_SECRET_ID: slackSigningParameterName,
+      SLACK_BOT_TOKEN_SECRET_ID: slackBotTokenParameterName,
       AGENTCORE_RUNTIME_ARN: slackAgentRuntime.runtimeArn,
       AGENTCORE_RUNTIME_QUALIFIER: agentCoreRuntimeQualifier,
       DEFAULT_SCHEDULE_CHANNEL: defaultScheduleChannel,
+      SCHEDULER_SCHEDULE_GROUP_NAME: schedulerScheduleGroupName,
+      SCHEDULER_SCHEDULE_NAME_PREFIX: schedulerScheduleNamePrefix,
+      SCHEDULER_DEFAULT_TIME_ZONE: schedulerDefaultTimeZone,
       EVENT_DEDUP_TTL_SECONDS: "86400",
       AGENT_RESPONSE_TIMEOUT_MS: "120000",
       TOP_LEVEL_CONTEXT_TURN_LIMIT: "10",
       MAX_SLACK_FILE_BYTES: "10000000",
     };
 
+    const commonEnvironment = {
+      ...commonRuntimeEnvironment,
+      SLACK_SIGNING_SECRET_SECRET_ID: slackSigningParameterName,
+      SLACK_BOT_TOKEN_SECRET_ID: slackBotTokenParameterName,
+    };
+
     const toolEnvironment = {
       CALENDAR_DRAFTS_TABLE_NAME: calendarDraftsTable.tableName,
-      GOOGLE_CALENDAR_SECRET_ID: googleCalendarSecretName,
+      GOOGLE_CALENDAR_SECRET_ID: googleCalendarParameterName,
       GOOGLE_OAUTH_CONNECTIONS_TABLE_NAME: googleOAuthConnectionsTable.tableName,
       GOOGLE_CALENDAR_TIME_ZONE: googleCalendarTimeZone,
     };
@@ -242,12 +295,34 @@ export class SlackAiAssistantStack extends Stack {
     const worker = createNodeFunction(this, "SlackEventsWorkerFunction", {
       entry: "slack-events-worker",
       timeout: Duration.minutes(5),
-      memorySize: 512,
+      memorySize: 2048,
       environment: {
         ...commonEnvironment,
         ...toolEnvironment,
         SOURCE_DOCUMENTS_TABLE_NAME: sourceDocumentsTable.tableName,
         SLACK_ATTACHMENT_ARCHIVE_BUCKET_NAME: attachmentArchiveBucket.bucketName,
+      },
+    });
+
+    const lineIngress = createNodeFunction(this, "LineEventsIngressFunction", {
+      entry: "line-events-ingress",
+      timeout: Duration.seconds(10),
+      memorySize: 256,
+      environment: {
+        ...commonRuntimeEnvironment,
+        LINE_CHANNEL_SECRET_SECRET_ID: lineChannelSecretParameterName,
+        LINE_QUEUE_URL: lineEventsQueue.queueUrl,
+      },
+    });
+
+    const lineWorker = createNodeFunction(this, "LineEventsWorkerFunction", {
+      entry: "line-events-worker",
+      timeout: Duration.minutes(5),
+      memorySize: 512,
+      environment: {
+        ...commonRuntimeEnvironment,
+        ...toolEnvironment,
+        LINE_CHANNEL_ACCESS_TOKEN_SECRET_ID: lineChannelAccessTokenParameterName,
       },
     });
 
@@ -311,7 +386,7 @@ export class SlackAiAssistantStack extends Stack {
       memorySize: 256,
       environment: {
         ...commonEnvironment,
-        GOOGLE_CALENDAR_SECRET_ID: googleCalendarSecretName,
+        GOOGLE_CALENDAR_SECRET_ID: googleCalendarParameterName,
         GOOGLE_OAUTH_CONNECTIONS_TABLE_NAME: googleOAuthConnectionsTable.tableName,
         GOOGLE_CALENDAR_TIME_ZONE: googleCalendarTimeZone,
       },
@@ -323,6 +398,12 @@ export class SlackAiAssistantStack extends Stack {
       }),
     );
 
+    lineWorker.addEventSource(
+      new eventsources.SqsEventSource(lineEventsQueue, {
+        batchSize: 1,
+      }),
+    );
+
     documentImportWorker.addEventSource(
       new eventsources.SqsEventSource(documentImportQueue, {
         batchSize: 1,
@@ -330,11 +411,14 @@ export class SlackAiAssistantStack extends Stack {
     );
 
     slackEventsQueue.grantSendMessages(ingress);
+    lineEventsQueue.grantSendMessages(lineIngress);
     documentImportQueue.grantSendMessages(documentImportApi);
     sessionTable.grantReadWriteData(worker);
     sessionTable.grantReadWriteData(scheduledRunner);
     conversationSessionsTable.grantReadWriteData(worker);
+    conversationSessionsTable.grantReadWriteData(lineWorker);
     conversationTurnsTable.grantReadWriteData(worker);
+    conversationTurnsTable.grantReadWriteData(lineWorker);
     userMemoryTable.grantReadWriteData(worker);
     userMemoryTable.grantReadWriteData(scheduledRunner);
     memoryItemsTable.grantReadWriteData(worker);
@@ -366,11 +450,15 @@ export class SlackAiAssistantStack extends Stack {
     taskEventsTable.grantReadWriteData(chatApi);
     taskEventsTable.grantReadWriteData(slackInteractions);
     processedEventsTable.grantReadWriteData(ingress);
+    processedEventsTable.grantReadWriteData(lineIngress);
     scheduledTasksTable.grantReadWriteData(scheduledRunner);
     recurringTasksTable.grantReadWriteData(scheduledRunner);
+    providerBindingsTable.grantReadData(ingress);
+    providerBindingsTable.grantReadData(lineIngress);
     userMemoryTable.grantReadWriteData(chatApi);
     memoryItemsTable.grantReadWriteData(slackInteractions);
     attachmentArchiveBucket.grantPut(worker, "raw/private/slack/*");
+    attachmentArchiveBucket.grantRead(worker, "raw/private/slack/*");
     attachmentArchiveBucket.grantPut(documentImportApi, "raw/private/imports/*");
     attachmentArchiveBucket.grantPut(documentImportApi, "raw/private/notes/*");
     attachmentArchiveBucket.grantRead(documentImportApi, "raw/private/imports/*");
@@ -379,37 +467,22 @@ export class SlackAiAssistantStack extends Stack {
     attachmentArchiveBucket.grantRead(documentImportWorker, "raw/private/notes/*");
     attachmentArchiveBucket.grantPut(documentImportWorker, "derived/private/extractions/*");
 
-    const slackSigningSecret = secretsmanager.Secret.fromSecretNameV2(
-      this,
-      "SlackSigningSecret",
-      slackSigningSecretName,
-    );
-    const slackBotTokenSecret = secretsmanager.Secret.fromSecretNameV2(
-      this,
-      "SlackBotTokenSecret",
-      slackBotTokenSecretName,
-    );
-    const googleCalendarSecret = secretsmanager.Secret.fromSecretNameV2(
-      this,
-      "GoogleCalendarSecret",
-      googleCalendarSecretName,
-    );
-
-    slackSigningSecret.grantRead(ingress);
-    slackSigningSecret.grantRead(slackInteractions);
-    slackSigningSecret.grantRead(googleOAuth);
-    slackBotTokenSecret.grantRead(worker);
-    slackBotTokenSecret.grantRead(scheduledRunner);
-    slackBotTokenSecret.grantRead(slackInteractions);
-    googleCalendarSecret.grantRead(worker);
-    googleCalendarSecret.grantRead(scheduledRunner);
-    googleCalendarSecret.grantRead(documentImportWorker);
-    googleCalendarSecret.grantRead(chatApi);
-    googleCalendarSecret.grantRead(slackInteractions);
-    googleCalendarSecret.grantRead(googleOAuth);
-    googleCalendarSecret.grantRead(slackAgentRuntime.role);
+    grantSecureParameterRead(this, slackSigningParameterName, [ingress, slackInteractions, googleOAuth]);
+    grantSecureParameterRead(this, slackBotTokenParameterName, [worker, scheduledRunner, slackInteractions]);
+    grantSecureParameterRead(this, lineChannelSecretParameterName, [lineIngress]);
+    grantSecureParameterRead(this, lineChannelAccessTokenParameterName, [lineWorker]);
+    grantSecureParameterRead(this, googleCalendarParameterName, [
+      worker,
+      scheduledRunner,
+      documentImportWorker,
+      chatApi,
+      slackInteractions,
+      googleOAuth,
+      slackAgentRuntime.role,
+    ]);
 
     memoryItemsTable.grantReadWriteData(slackAgentRuntime.role);
+    scheduledTasksTable.grantReadWriteData(slackAgentRuntime.role);
     tasksTable.grantReadWriteData(slackAgentRuntime.role);
     taskEventsTable.grantReadWriteData(slackAgentRuntime.role);
     recurringTasksTable.grantReadWriteData(slackAgentRuntime.role);
@@ -422,10 +495,11 @@ export class SlackAiAssistantStack extends Stack {
       }),
     );
     slackAgentRuntime.grantInvoke(worker);
+    slackAgentRuntime.grantInvoke(lineWorker);
     slackAgentRuntime.grantInvoke(scheduledRunner);
     slackAgentRuntime.grantInvoke(documentImportWorker);
     slackAgentRuntime.grantInvoke(chatApi);
-    for (const agentInvoker of [worker, scheduledRunner, documentImportWorker, chatApi]) {
+    for (const agentInvoker of [worker, lineWorker, scheduledRunner, documentImportWorker, chatApi]) {
       agentInvoker.addToRolePolicy(
         new iam.PolicyStatement({
           actions: [
@@ -453,6 +527,10 @@ export class SlackAiAssistantStack extends Stack {
       .getResource("slack")!
       .addResource("interactions")
       .addMethod("POST", new apigateway.LambdaIntegration(slackInteractions));
+    api.root
+      .addResource("line")
+      .addResource("webhook")
+      .addMethod("POST", new apigateway.LambdaIntegration(lineIngress));
     const oauthResource = api.root.addResource("oauth").addResource("google");
     oauthResource.addResource("start").addMethod("GET", new apigateway.LambdaIntegration(googleOAuth));
     oauthResource.addResource("callback").addMethod("GET", new apigateway.LambdaIntegration(googleOAuth));
@@ -460,6 +538,7 @@ export class SlackAiAssistantStack extends Stack {
     if (googleOAuthStartUrl) {
       worker.addEnvironment("GOOGLE_OAUTH_START_URL", googleOAuthStartUrl);
       scheduledRunner.addEnvironment("GOOGLE_OAUTH_START_URL", googleOAuthStartUrl);
+      lineWorker.addEnvironment("GOOGLE_OAUTH_START_URL", googleOAuthStartUrl);
       documentImportWorker.addEnvironment("GOOGLE_OAUTH_START_URL", googleOAuthStartUrl);
       chatApi.addEnvironment("GOOGLE_OAUTH_START_URL", googleOAuthStartUrl);
       slackInteractions.addEnvironment("GOOGLE_OAUTH_START_URL", googleOAuthStartUrl);
@@ -502,26 +581,59 @@ export class SlackAiAssistantStack extends Stack {
       assumedBy: new iam.ServicePrincipal("scheduler.amazonaws.com"),
     });
     scheduledRunner.grantInvoke(schedulerInvokeRole);
-
-    new scheduler.CfnSchedule(this, "DailySummarySchedule", {
-      flexibleTimeWindow: { mode: "OFF" },
-      scheduleExpression: "cron(0 9 * * ? *)",
-      scheduleExpressionTimezone: "Asia/Tokyo",
-      state: "ENABLED",
-      target: {
-        arn: scheduledRunner.functionArn,
-        roleArn: schedulerInvokeRole.roleArn,
-        input: JSON.stringify({
-          taskId: "daily-summary",
-        }),
-      },
+    const scheduledReminderScheduleGroup =
+      schedulerScheduleGroupName === "default"
+        ? undefined
+        : new scheduler.CfnScheduleGroup(this, "ScheduledReminderScheduleGroup", {
+            name: schedulerScheduleGroupName,
+          });
+    for (const agentInvoker of [worker, lineWorker, documentImportWorker, chatApi]) {
+      agentInvoker.addEnvironment("SCHEDULER_TARGET_ARN", scheduledRunner.functionArn);
+      agentInvoker.addEnvironment("SCHEDULER_TARGET_ROLE_ARN", schedulerInvokeRole.roleArn);
+    }
+    const scheduledReminderArnPattern = this.formatArn({
+      service: "scheduler",
+      resource: "schedule",
+      resourceName: `${schedulerScheduleGroupName}/${schedulerScheduleNamePrefix}-*`,
     });
+    slackAgentRuntime.addToPolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "scheduler:CreateSchedule",
+          "scheduler:DeleteSchedule",
+          "scheduler:GetSchedule",
+          "scheduler:UpdateSchedule",
+        ],
+        resources: [scheduledReminderArnPattern],
+      }),
+    );
+    slackAgentRuntime.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["iam:PassRole"],
+        resources: [schedulerInvokeRole.roleArn],
+        conditions: {
+          StringEquals: {
+            "iam:PassedToService": "scheduler.amazonaws.com",
+          },
+        },
+      }),
+    );
+
+    if (scheduledReminderScheduleGroup) {
+      scheduledRunner.node.addDependency(scheduledReminderScheduleGroup);
+    }
 
     new cdk.CfnOutput(this, "SlackEventsUrl", {
       value: `${api.url}slack/events`,
     });
     new cdk.CfnOutput(this, "SlackEventsQueueUrl", {
       value: slackEventsQueue.queueUrl,
+    });
+    new cdk.CfnOutput(this, "LineWebhookUrl", {
+      value: `${api.url}line/webhook`,
+    });
+    new cdk.CfnOutput(this, "LineEventsQueueUrl", {
+      value: lineEventsQueue.queueUrl,
     });
     new cdk.CfnOutput(this, "DocumentImportApiFunctionName", {
       value: documentImportApi.functionName,
@@ -544,6 +656,12 @@ export class SlackAiAssistantStack extends Stack {
     new cdk.CfnOutput(this, "SlackEventsWorkerFunctionName", {
       value: worker.functionName,
     });
+    new cdk.CfnOutput(this, "LineEventsIngressFunctionName", {
+      value: lineIngress.functionName,
+    });
+    new cdk.CfnOutput(this, "LineEventsWorkerFunctionName", {
+      value: lineWorker.functionName,
+    });
     new cdk.CfnOutput(this, "SlackInteractionsUrl", {
       value: `${api.url}slack/interactions`,
     });
@@ -564,6 +682,9 @@ export class SlackAiAssistantStack extends Stack {
     });
     new cdk.CfnOutput(this, "RecurringTasksTableName", {
       value: recurringTasksTable.tableName,
+    });
+    new cdk.CfnOutput(this, "ProviderBindingsTableName", {
+      value: providerBindingsTable.tableName,
     });
     new cdk.CfnOutput(this, "MemoryItemsTableName", {
       value: memoryItemsTable.tableName,
@@ -685,6 +806,36 @@ function buildAgentCoreProjectSpec(input: {
   };
 }
 
+function grantSecureParameterRead(scope: Stack, parameterName: string, grantees: iam.IGrantable[]): void {
+  const parameterArn = parameterName.startsWith("arn:")
+    ? parameterName
+    : scope.formatArn({
+        service: "ssm",
+        resource: "parameter",
+        resourceName: trimLeadingSlash(parameterName),
+      });
+
+  for (const grantee of grantees) {
+    grantee.grantPrincipal.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: ["ssm:GetParameter"],
+        resources: [parameterArn],
+      }),
+    );
+    grantee.grantPrincipal.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: ["kms:Decrypt"],
+        resources: ["*"],
+        conditions: {
+          StringEquals: {
+            "kms:ViaService": `ssm.${scope.region}.amazonaws.com`,
+          },
+        },
+      }),
+    );
+  }
+}
+
 function normalizeConfigValue(value: unknown): string | undefined {
   if (Array.isArray(value)) {
     const parts = value
@@ -711,4 +862,8 @@ function normalizeConfigValue(value: unknown): string | undefined {
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
+}
+
+function trimLeadingSlash(value: string): string {
+  return value.replace(/^\/+/, "");
 }

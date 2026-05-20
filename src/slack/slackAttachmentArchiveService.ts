@@ -24,16 +24,18 @@ export class SlackAttachmentArchiveService {
     private readonly repository: SourceDocumentRepository,
   ) {}
 
-  async archiveAttachments(input: ArchiveSlackAttachmentsInput): Promise<void> {
+  async archiveAttachments(input: ArchiveSlackAttachmentsInput): Promise<SourceDocument[]> {
+    const documents: SourceDocument[] = [];
     for (const attachment of input.attachments) {
-      await this.archiveAttachment(input, attachment);
+      documents.push(await this.archiveAttachment(input, attachment));
     }
+    return documents;
   }
 
   private async archiveAttachment(
     input: Omit<ArchiveSlackAttachmentsInput, "attachments">,
     attachment: PreparedSlackAttachment,
-  ): Promise<void> {
+  ): Promise<SourceDocument> {
     const sourceId = `src_${randomUUID()}`;
     const now = new Date().toISOString();
     const baseDocument: SourceDocument = {
@@ -56,8 +58,7 @@ export class SlackAttachmentArchiveService {
     };
 
     if (attachment.status !== "ready" || !attachment.contentBytes) {
-      await this.persistDocument(baseDocument, input.logger);
-      return;
+      return this.persistDocument(baseDocument, input.logger);
     }
 
     const checksum = createHash("sha256").update(attachment.contentBytes).digest("hex");
@@ -79,7 +80,7 @@ export class SlackAttachmentArchiveService {
         }),
       );
 
-      await this.persistDocument(
+      return this.persistDocument(
         {
           ...baseDocument,
           checksum,
@@ -97,7 +98,7 @@ export class SlackAttachmentArchiveService {
         error: message,
       });
 
-      await this.persistDocument(
+      return this.persistDocument(
         {
           ...baseDocument,
           checksum,
@@ -109,15 +110,16 @@ export class SlackAttachmentArchiveService {
     }
   }
 
-  private async persistDocument(document: SourceDocument, logger: Logger): Promise<void> {
+  private async persistDocument(document: SourceDocument, logger: Logger): Promise<SourceDocument> {
     try {
-      await this.repository.save(document);
+      return await this.repository.save(document);
     } catch (error) {
       logger.warn("Source document metadata persist failed", {
         sourceId: document.sourceId,
         slackFileId: document.slackFileId,
         error: error instanceof Error ? error.message : "Unknown repository error",
       });
+      return document;
     }
   }
 }

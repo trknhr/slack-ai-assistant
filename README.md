@@ -4,9 +4,10 @@ Serverless AI assistant infrastructure for chat workspaces, built on AWS Lambda,
 API Gateway, SQS, DynamoDB, S3, EventBridge Scheduler, and Amazon Bedrock
 AgentCore.
 
-The current `v0.1.0` implementation ships a Slack adapter. The longer-term
-direction is a shared serverless assistant core with first-class Slack and LINE
-adapters, plus an optional Discord adapter.
+The current `v0.1.0` implementation ships a Slack adapter. The next adapter is
+an experimental LINE text-message webhook path. The longer-term direction is a
+shared serverless assistant core with first-class Slack and LINE adapters, plus
+an optional Discord adapter.
 
 The assistant keeps model reasoning, tool execution, and runtime isolation inside
 AgentCore while AWS handles webhooks, queues, state, scheduled jobs, document
@@ -28,7 +29,7 @@ ingestion, and chat-platform delivery.
 Planned adapter direction:
 
 - Slack: implemented in `v0.1.0`
-- LINE: intended as a first-class adapter after the assistant core stabilizes
+- LINE: experimental text-message webhook adapter in progress
 - Discord: optional adapter after Slack/LINE patterns are clear
 
 ## Architecture
@@ -41,6 +42,14 @@ Slack mention / DM / thread reply
   -> Lambda (slack-events-worker)
   -> AgentCore Runtime (SlackAgent)
   -> Slack reply
+
+LINE text message
+  -> API Gateway
+  -> Lambda (line-events-ingress)
+  -> SQS
+  -> Lambda (line-events-worker)
+  -> AgentCore Runtime (SlackAgent)
+  -> LINE push message
 
 Scheduled reminder
   -> EventBridge Scheduler
@@ -84,6 +93,8 @@ requests, tool resources, memory, tasks, documents, and calendar workflows.
 - Slack Events API ingress Lambda
 - Slack async worker Lambda
 - Slack interactions Lambda
+- LINE webhook ingress Lambda
+- LINE async worker Lambda
 - scheduled Agent runner Lambda
 - document import API Lambda
 - document import worker Lambda
@@ -107,6 +118,8 @@ The stack creates these DynamoDB tables:
 - `ProcessedEventsTable`: Slack event deduplication
 - `ScheduledTasksTable`: scheduled Agent run definitions such as `daily-summary`
 - `RecurringTasksTable`: recurring task rules materialized by the scheduler
+- `ProviderBindingsTable`: Slack/LINE provider account and conversation bindings
+  to internal workspaces
 - `UserMemoriesTable`: legacy table retained to avoid destructive stack changes
 - `MemoryItemsTable`: workspace-scoped durable memory
 - `TasksTable`: current task state
@@ -141,16 +154,29 @@ tests/
 
 ## Prerequisites
 
-1. Create these AWS Secrets Manager secrets:
+1. Create these AWS Systems Manager Parameter Store `SecureString` parameters:
    - `/slack-ai-assistant/slack-signing-secret`
    - `/slack-ai-assistant/slack-bot-token`
+   - `/slack-ai-assistant/line-channel-secret`
+   - `/slack-ai-assistant/line-channel-access-token`
    - `/slack-ai-assistant/google-calendar`
+
+   Example:
+
+   ```bash
+   aws ssm put-parameter \
+     --name /slack-ai-assistant/line-channel-access-token \
+     --type SecureString \
+     --value 'YOUR_LINE_CHANNEL_ACCESS_TOKEN' \
+     --overwrite
+   ```
+
 2. Ensure the target AWS account has access to Bedrock AgentCore and the
    configured Bedrock model IDs.
 3. Install Docker for AgentCore container image builds.
 4. Bootstrap CDK in the target AWS account and region.
 
-Google Calendar OAuth client secret JSON:
+Google Calendar OAuth client parameter JSON:
 
 ```json
 {
@@ -177,7 +203,7 @@ npm install
 npx cdk deploy \
   -c defaultScheduleChannel=C0123456789 \
   -c bedrockModelId=moonshotai.kimi-k2.5 \
-  -c bedrockDocumentModelId=apac.anthropic.claude-sonnet-4-20250514-v1:0 \
+  -c bedrockDocumentModelId=moonshotai.kimi-k2.5 \
   -c publicBaseUrl=https://your-api-id.execute-api.ap-northeast-1.amazonaws.com/prod
 ```
 
@@ -186,11 +212,12 @@ Context options:
 - `defaultScheduleChannel`: Slack channel used when the scheduled runner creates
   the fallback `daily-summary` task
 - `bedrockModelId`: default Bedrock model used by the AgentCore runtime
-- `bedrockDocumentModelId`: Bedrock model used when requests include PDF or
-  other document input
+- `bedrockDocumentModelId`: Bedrock model used when requests include image,
+  PDF, or other binary document input
 - `publicBaseUrl`: deployed API base URL used in Slack replies, especially for
   Google Calendar OAuth links
-- `googleCalendarSecretName`: optional override for the Google Calendar secret
+- `googleCalendarParameterName`: optional override for the Google Calendar
+  `SecureString` parameter
 - `googleCalendarTimeZone`: optional override for calendar defaults
 
 After deploy, configure Slack with these CDK outputs:
@@ -198,6 +225,10 @@ After deploy, configure Slack with these CDK outputs:
 - `SlackEventsUrl`: Slack Events API request URL
 - `SlackInteractionsUrl`: Slack interactivity request URL
 - `GoogleOAuthCallbackUrl`: Google OAuth redirect URI
+
+Configure LINE with this CDK output:
+
+- `LineWebhookUrl`: LINE Messaging API webhook URL
 
 ## AgentCore Runtime
 
@@ -227,6 +258,42 @@ Current memory scopes:
 - workspace memory: workspace-level memory used by imports, direct chat fallback,
   and scheduled reminders
 
+Provider bindings separate external chat IDs from internal workspaces:
+
+- `workspaceId`: internal tenant or contract workspace
+- `channelId`: provider conversation key such as `line:group:{groupId}` or a
+  Slack channel ID
+- `userId`: provider user key used for user preferences and OAuth ownership
+- `providerAccountId`: provider-side account such as a Slack team ID or LINE
+  webhook destination
+
+Ingress functions resolve `workspaceId` through `ProviderBindingsTable` using
+provider account and conversation keys. If no binding exists, Slack falls back
+to the Slack team ID and LINE falls back to the LINE chat key, preserving local
+OSS behavior while allowing business deployments to map many provider
+conversations into contract workspaces.
+
+Create or update a provider binding locally:
+
+```bash
+npm run put-provider-binding -- \
+  --table-name YOUR_PROVIDER_BINDINGS_TABLE \
+  --region ap-northeast-1 \
+  --provider line \
+  --provider-account-id Ubot \
+  --binding-kind conversation \
+  --provider-conversation-key group:G1234567890 \
+  --workspace-id ws_contract_123 \
+  --conversation-id line:group:G1234567890
+```
+
+Provider conversation key examples:
+
+- LINE group: `group:{groupId}`
+- LINE room: `room:{roomId}`
+- LINE user: `user:{userId}`
+- Slack channel: `channel:{channelId}`
+
 Slack conversations currently prevent direct workspace memory writes. Inferred
 channel memory is saved as a candidate, while scheduled reminders run with
 workspace scope.
@@ -237,12 +304,17 @@ provenance, audit logs, and per-channel opt-in controls.
 
 ## Scheduled Reminders
 
-EventBridge Scheduler invokes `scheduled-agent-runner` with `taskId:
-daily-summary` by default.
+EventBridge Scheduler invokes `scheduled-agent-runner` with a `taskId`.
+Scheduled task definitions live in `ScheduledTasksTable`, while EventBridge
+Scheduler owns the actual trigger. The Slack assistant can create, list, edit,
+disable, and delete scheduled reminders by using its scheduled reminder tools.
+CDK does not create a fixed default reminder; create reminders from Slack or by
+writing a scheduled task definition and matching EventBridge schedule.
 
-Scheduled task definitions live in `ScheduledTasksTable`. The runner also
-materializes enabled recurring task definitions for the next 7 days before
-building the reminder prompt.
+The runner also materializes enabled recurring task definitions for the next 7
+days before building the reminder prompt. Scheduled reminders control when the
+assistant posts; recurring task definitions control which repeated duties are
+included in the reminder.
 
 Example scheduled task:
 
@@ -255,13 +327,26 @@ Example scheduled task:
   "workspaceId": "T0123456789",
   "outputChannelId": "C0123456789",
   "enabled": true,
+  "scheduleName": "slack-ai-assistant-daily-summary-dc0570d6ff",
+  "scheduleGroupName": "default",
+  "scheduleExpression": "cron(0 8 * * ? *)",
+  "scheduleExpressionTimezone": "Asia/Tokyo",
   "reuseSession": false,
   "createdAt": "2026-04-13T00:00:00.000Z",
   "updatedAt": "2026-04-13T00:00:00.000Z"
 }
 ```
 
-Create or update a scheduled task locally:
+Example Slack requests:
+
+```text
+@AI 毎朝8時に今日のタスクリマインダーを投稿して
+@AI 朝のタスクリマインダーを9時に変更して
+@AI 定期通知の一覧を見せて
+@AI 朝のタスクリマインダーを削除して
+```
+
+Create or update a scheduled task definition locally:
 
 ```bash
 npx ts-node scripts/put-scheduled-task.ts \
@@ -466,8 +551,8 @@ and lines.
 - Do not commit real tokens, secret values, account IDs, runtime ARNs, or
   environment IDs.
 - Do not commit `cdk.out/` artifacts or other generated deployment outputs.
-- Keep Slack signing secrets, bot tokens, and Google OAuth client secrets in
-  Secrets Manager only.
+- Keep Slack signing secrets, bot tokens, LINE tokens, and Google OAuth client
+  secrets in SSM Parameter Store `SecureString` parameters only.
 - `imports/*` and `/chat/messages` routes use `AWS_IAM` authorization.
 - Local scripts sign requests with SigV4 using the current AWS credentials.
 - IAM principals running local scripts need `execute-api:Invoke` permission for
@@ -477,7 +562,7 @@ and lines.
 
 Near-term post-`v0.1.0` work:
 
-- LINE adapter as a first-class messaging integration
+- LINE adapter hardening beyond basic text webhook support
 - admin page for channel-level workspace memory promotion policies
 - explicit approval flow for promoting channel memory to workspace memory
 - source provenance and audit logs for workspace-visible knowledge

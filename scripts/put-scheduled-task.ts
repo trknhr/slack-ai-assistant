@@ -49,7 +49,7 @@ async function main(): Promise<void> {
     new PutCommand({
       TableName: options.tableName,
       Item: {
-        pk: buildScheduledTaskPk(task.taskId),
+        pk: buildScheduledTaskPk(task.workspaceId, task.taskId),
         taskId: task.taskId,
         name: task.name,
         prompt: task.prompt,
@@ -68,7 +68,7 @@ async function main(): Promise<void> {
   );
 
   console.log(`Saved scheduled task ${task.taskId} to ${options.tableName}`);
-  console.log(`pk: ${buildScheduledTaskPk(task.taskId)}`);
+  console.log(`pk: ${buildScheduledTaskPk(task.workspaceId, task.taskId)}`);
 }
 
 async function parseArgs(argv: string[]): Promise<CliOptions> {
